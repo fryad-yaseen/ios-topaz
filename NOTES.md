@@ -1,5 +1,12 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Sapphire speaker amp handoff (2026-10-23)
+
+- Commit `4447966701715369c78ff90c0274a059cb296235` adds `xnu/patches/1005-sapphire-speaker-amp.patch` and `tools/extract-sapphire-amp.py` on `sapphire-gpu`. No push or phone access was performed.
+- `sapphire_amp=1` selects runtime FS1815 (0x34/0x35, 16-bit ID register 0x01 low byte 0x12) or AW87559 (0x58/0x5b, 8-bit ID register 0x00 value 0x5a) on QUP0 SE1. GPIO105/99 are TLMM SOUTH reset outputs. The firmware Music and Off tables are pinned to SHA256 values in the patch and extractor. Stream start and stop use the existing `amp_on()` calls; default boot keeps the topaz path.
+- Verified offline: applied upstream 0140-0152, 0900-0950, then sapphire 1000-1004 to a copy of xnu-8796 at `2afc29f`; `git apply --check` and application of 1005 succeeded in a fresh copy. Targeted `clang++ -fsyntax-only` on the amp block and `clang -fsyntax-only` on the I2C helper passed. The embedded arrays match both vendor firmware entries. No full XNU build or device playback test was run.
+- Next device check, if authorized separately: boot with `sapphire_amp=1` and inspect `TopazAudio: amp` lines for IDs, detected mask, init errors, and active mask. FS1815 uses a digital I2S input; the existing AudioReach graph uses WCD937x RX2/AUX. Whether that graph feeds the FS1815 path is unverified and may need a separate MI2S graph change. GPIO99 is also named by a camera VIO pinctrl state in the base DT, so test camera interaction later.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
