@@ -1,0 +1,32 @@
+From 0644184443027d34c2bfd156387b4b32c30b381e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 22 Oct 2026 23:47:22 +0300
+Subject: [PATCH] sapphire 1004: Apple80211 capabilities include TKIP (group
+ key of WPA/WPA2 mixed networks)
+
+FTTH-KM2T (pair tkip+ccmp, group tkip, psk): wifid stopped after DISASSOCIATE + 422 without ASSOCIATE; a CCMP-only hotspot joined. TopazModem already installs a TKIP group key (s_group_cipher).
+---
+ bsd/dev/redwood_apple80211.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index 0cf467b..df93f69 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -311,7 +311,12 @@ get(struct apple80211req *request)
+ 		 * for a WPA2 network ("Unable to join").
+ 		 */
+ 		uint8_t bits[13] = { 0 };
+-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++		/*
++		 * sapphire: also TKIP (1) and TKIP MIC (12). A WPA/WPA2 mixed network with a TKIP group key
++		 * (common on ISP routers) is otherwise never joined: wifid sees a cipher the card lacks and
++		 * stops before ASSOCIATE. The pairwise key stays CCMP; TopazModem installs a TKIP group key.
++		 */
++		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19 };
+ 
+ 		for (unsigned i = 0; i < sizeof(has); i++) {
+ 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
+-- 
+2.56.0
+
