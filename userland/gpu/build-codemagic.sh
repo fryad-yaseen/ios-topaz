@@ -70,12 +70,12 @@ else
 fi
 
 target=(-target arm64-apple-ios16.0 -isysroot "$sdk")
-"$cc" "${target[@]}" "${iokit_include[@]}" -I"$mesa" \
+"$cc" "${target[@]}" ${iokit_include[@]+"${iokit_include[@]}"} -I"$mesa" \
   -dynamiclib -Wl,-undefined,error -install_name /topaz/lib/libtopaz-gl.dylib \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc \
   "$lib/libOSMesa.8.dylib" \
   userland/gpu/eagl.c userland/gpu/gl_osmesa.c -o "$lib/libtopaz-gl.dylib"
-"$cc" "${target[@]}" "${iokit_include[@]}" \
+"$cc" "${target[@]}" ${iokit_include[@]+"${iokit_include[@]}"} \
   -dynamiclib -Wl,-undefined,error -install_name /topaz/lib/libtopaz-inject.dylib \
   -framework CoreFoundation -framework IOKit -lobjc \
   userland/gpu/topaz_inject.c -o "$lib/libtopaz-inject.dylib"
