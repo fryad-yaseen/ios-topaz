@@ -1,12 +1,13 @@
 # The kernel build of .github/workflows/xnu.yml on Codemagic (for when GitHub's macOS
-# runners are short). Xcode 15.4: its iig matches the xnu-8796 IORPC ABI.
+# runners are short). Codemagic has no Xcode 15, whose iig matches the xnu-8796 IORPC ABI,
+# so iig is replaced by tools/iig-pregen.sh (Xcode 15.4's output, kept in xnu/iig-pregen).
 workflows:
   xnu:
     name: xnu kernel
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      xcode: 15.4
+      xcode: 16.0
       vars:
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
         DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
@@ -46,6 +47,7 @@ workflows:
       - name: Build
         script: |
           cd dxb
+          export IIG=$CM_BUILD_DIR/tools/iig-pregen.sh
           PATH=$(brew --prefix)/bin:$PATH bash build.sh
       - name: Collect
         script: |
