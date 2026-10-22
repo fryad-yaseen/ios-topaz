@@ -3,7 +3,7 @@
 # so iig is replaced by tools/iig-pregen.sh (Xcode 15.4's output, kept in xnu/iig-pregen).
 workflows:
   xnu:
-    name: xnu kernel
+    name: xnu kernel and GPU userland
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
@@ -59,6 +59,16 @@ workflows:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
           test -s out/kernel.development.sweet
+      - name: Build GPU userland
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          mkdir -p out-userland
+          bash userland/gpu/build-codemagic.sh 2>&1 | tee out-userland/build.log
     artifacts:
       - out/kernel.development.sweet
       - out/SHA256SUMS
+      - out-userland/topaz/lib/*.dylib
+      - out-userland/SHA256SUMS
+      - out-userland/otool-L.txt
+      - out-userland/build.log
