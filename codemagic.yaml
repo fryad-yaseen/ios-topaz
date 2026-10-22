@@ -1,0 +1,64 @@
+# The kernel build of .github/workflows/xnu.yml on Codemagic (for when GitHub's macOS
+# runners are short). Codemagic has no Xcode 15, whose iig matches the xnu-8796 IORPC ABI,
+# so iig is replaced by tools/iig-pregen.sh (Xcode 15.4's output, kept in xnu/iig-pregen).
+workflows:
+  xnu:
+    name: xnu kernel
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 16.0
+      vars:
+        DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+        MACOS_VERSION: "13.5"
+        KERNEL_CONFIG: DEVELOPMENT
+        MACHINE_CONFIG: SWEET
+        MAKEFLAGS: -k
+    scripts:
+      - name: Fetch build script
+        script: |
+          set -e
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
+          # CC/CXX wrappers as on GitHub (there they add ccache; here plain clang)
+          sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CC_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CC_WRAP/clang++"|' dxb/build.sh
+          grep -c 'export CC="$CC_WRAP/clang"' dxb/build.sh
+          # blacktop's build.sh only warns and skips a patch that does not apply; ours must apply
+          sed -i '' 's|warning "Skipping patch ${PATCH}|case "$(basename "$PATCH")" in [0-9][0-9][0-9][0-9]-*) error "patch does not apply: ${PATCH}: ${APPLY_CHECK}"; exit 1;; esac; warning "Skipping patch ${PATCH}|' dxb/build.sh
+          grep -c 'patch does not apply' dxb/build.sh
+      - name: Deps
+        script: |
+          set -e
+          brew install jq gum bash cmake ninja
+          sudo mkdir -p /usr/local/bin
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          xcodebuild -version
+          xcrun --find iig
+          mkdir -p "$CM_BUILD_DIR/cc-bin"
+          for t in clang clang++; do
+            printf '#!/bin/sh\nexec %s "$@"\n' "$(xcrun -find $t)" > "$CM_BUILD_DIR/cc-bin/$t"
+            chmod +x "$CM_BUILD_DIR/cc-bin/$t"
+          done
+          echo "CC_WRAP=$CM_BUILD_DIR/cc-bin" >> "$CM_ENV"
+      - name: Build
+        script: |
+          cd dxb
+          export IIG=$CM_BUILD_DIR/tools/iig-pregen.sh
+          PATH=$(brew --prefix)/bin:$PATH bash build.sh
+      - name: Collect
+        script: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          test -s out/kernel.development.sweet
+    artifacts:
+      - out/kernel.development.sweet
+      - out/SHA256SUMS
