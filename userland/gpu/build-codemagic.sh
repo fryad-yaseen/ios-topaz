@@ -34,7 +34,8 @@ cp "$mesa/out/libOSMesa.8.dylib" "$lib/libOSMesa.8.dylib"
 
 # Mesa may link OSMesa against a separate shared glapi. Install that exact
 # library and change OSMesa's load command to the phone's absolute path.
-glapi_ref=$(otool -L "$lib/libOSMesa.8.dylib" | awk 'NR > 1 && $1 ~ /(^|\/)libglapi[^/]*\.dylib$/ { print $1 }')
+# (grep, not awk: macOS awk rejects "[^/]" inside /.../)
+glapi_ref=$(otool -L "$lib/libOSMesa.8.dylib" | tail -n +2 | awk '{ print $1 }' | grep -E '(^|/)libglapi[^/]*\.dylib$' || true)
 if [[ -n "$glapi_ref" ]]; then
   [[ "$glapi_ref" != *$'\n'* ]] || { echo "Multiple libglapi dependencies" >&2; exit 1; }
   glapi_name=${glapi_ref##*/}

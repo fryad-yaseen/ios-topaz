@@ -72,3 +72,20 @@ workflows:
       - out-userland/SHA256SUMS
       - out-userland/otool-L.txt
       - out-userland/build.log
+  gpu-userland:
+    name: GPU userland only
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    environment:
+      xcode: 16.0
+    scripts:
+      - name: Build GPU userland
+        script: |
+          set -euo pipefail
+          mkdir -p out-userland
+          bash userland/gpu/build-codemagic.sh 2>&1 | tee out-userland/build.log
+    artifacts:
+      - out-userland/topaz/lib/*.dylib
+      - out-userland/SHA256SUMS
+      - out-userland/otool-L.txt
+      - out-userland/build.log
