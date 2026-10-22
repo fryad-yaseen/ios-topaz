@@ -1,9 +1,10 @@
-From f4c4a5767cb241b81e07baeb3cf171de749de4fa Mon Sep 17 00:00:00 2001
+From 7e2534e84077ca135b0be6937d0744e4ca6aa4b4 Mon Sep 17 00:00:00 2001
 From: x <x@x>
-Date: Mon, 19 Oct 2026 20:13:17 +0300
+Date: Thu, 22 Oct 2026 20:28:57 +0300
 Subject: [PATCH] private 0900: en0 + Apple80211 for wifid over the TopazModem
  radio (from darwin-redwood, PRIVATE)
 
+From upstream ios-topaz e477291, rebased onto the sapphire series: iokit/conf/files.arm64 has no TopazAudio/TopazRpm/SweetAMFIService entries here (patches 0144-0151 are not in this series).
 ---
  bsd/conf/files                          |   4 +
  bsd/dev/redwood_apple80211.c            | 739 ++++++++++++++++++++++++
@@ -2307,10 +2308,10 @@ index d11fe26..73d9267 100644
  		ret = kIOReturnUnsupported;
  		break;
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 0c07743..21d5d31 100644
+index 19ef8ab..c6e8157 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -393,6 +393,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -380,6 +380,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
  	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
  	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
@@ -2329,7 +2330,7 @@ index 0c07743..21d5d31 100644
  	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
  	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
  	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
-@@ -406,7 +418,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -393,7 +405,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	}
  	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
  
@@ -2339,10 +2340,10 @@ index 0c07743..21d5d31 100644
  	if (planes != NULL) {
  		uint64_t next = s->offset;
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index 2fd4b6f..8aa0c2f 100644
+index 7c43f45..5981677 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -6385,6 +6385,8 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -6282,6 +6282,8 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  	thread_terminate(current_thread());
  }
  
@@ -2351,7 +2352,7 @@ index 2fd4b6f..8aa0c2f 100644
  extern "C" void
  topaz_modem_init(void)
  {
-@@ -6396,6 +6398,7 @@ topaz_modem_init(void)
+@@ -6293,6 +6295,7 @@ topaz_modem_init(void)
  		return;
  	}
  	started = true;
@@ -2360,12 +2361,12 @@ index 2fd4b6f..8aa0c2f 100644
  		thread_deallocate(thread);
  	}
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index 60ec873..4d3730b 100644
+index cc24c81..880e80c 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -15,6 +15,8 @@ iokit/Kernel/arm/TopazAudio.cpp                                  optional iokitc
- iokit/Kernel/arm/TopazRpm.cpp                                    optional iokitcpp
- iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+@@ -12,6 +12,8 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
  iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
 +iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
 +iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
@@ -2373,5 +2374,5 @@ index 60ec873..4d3730b 100644
  iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
 -- 
-2.43.0
+2.56.0
 

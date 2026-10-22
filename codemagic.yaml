@@ -28,6 +28,9 @@ workflows:
           # CC/CXX wrappers as on GitHub (there they add ccache; here plain clang)
           sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CC_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CC_WRAP/clang++"|' dxb/build.sh
           grep -c 'export CC="$CC_WRAP/clang"' dxb/build.sh
+          # blacktop's build.sh only warns and skips a patch that does not apply; ours must apply
+          sed -i '' 's|warning "Skipping patch ${PATCH}|case "$(basename "$PATCH")" in [0-9][0-9][0-9][0-9]-*) error "patch does not apply: ${PATCH}: ${APPLY_CHECK}"; exit 1;; esac; warning "Skipping patch ${PATCH}|' dxb/build.sh
+          grep -c 'patch does not apply' dxb/build.sh
       - name: Deps
         script: |
           set -e
