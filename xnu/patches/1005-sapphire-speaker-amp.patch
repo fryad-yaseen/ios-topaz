@@ -1,12 +1,12 @@
-From c21199fa360eb079d47a20f9906a0c0c305327b1 Mon Sep 17 00:00:00 2001
+From 3414f621b07238bf9f55ab65f505fd2d0bb83d0b Mon Sep 17 00:00:00 2001
 From: Sapphire Amp <sapphire-amp@localhost>
 Date: Fri, 23 Oct 2026 00:39:04 +0300
 Subject: [PATCH] sapphire: select speaker amp at runtime behind boot arg
 
 ---
  bsd/dev/sweet_i2c1.c            |  16 ++
- iokit/Kernel/arm/TopazAudio.cpp | 280 ++++++++++++++++++++++++++++++++
- 2 files changed, 296 insertions(+)
+ iokit/Kernel/arm/TopazAudio.cpp | 286 ++++++++++++++++++++++++++++++++
+ 2 files changed, 302 insertions(+)
 
 diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
 index 8037ad6..116f1b0 100644
@@ -43,7 +43,7 @@ index 8037ad6..116f1b0 100644
  sweet_i2c1_init(void)
  {
 diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
-index 6bfe1a2..05a572a 100644
+index 6bfe1a2..1ffaa4c 100644
 --- a/iokit/Kernel/arm/TopazAudio.cpp
 +++ b/iokit/Kernel/arm/TopazAudio.cpp
 @@ -1214,6 +1214,8 @@ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32
@@ -55,7 +55,7 @@ index 6bfe1a2..05a572a 100644
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
  static uint32_t call_token, call_op, call_words, call_rsp[16];
-@@ -1497,6 +1499,272 @@ ports_and_pa(void)
+@@ -1497,6 +1499,278 @@ ports_and_pa(void)
  	LOG("t=%u.%03u ports: rx frame b1 %08x, irq %08x", T, lr(RX_SWR + 0x105C), lr(RX_SWR + 0x200));
  }
  
@@ -187,11 +187,17 @@ index 6bfe1a2..05a572a 100644
 +	int err = 0;
 +
 +	if (!(sapphire_fs_ready & (1u << side))) {
-+		(void)sweet_i2c1_write16(addr, 0x10, 0x0002); /* soft reset may NACK */
-+		IOSleep(15);
-+		err = sweet_i2c1_write16(addr, 0x10, 0x0001);
-+		if (!err) err = sapphire_fs_read(addr, 0x0e, &init);
-+		LOG("amp FS1815 0x%02x reset/init=0x%04x err=%d", addr, init, err);
++		for (unsigned attempt = 0; attempt < 5; attempt++) {
++			uint16_t ignored = 0;
++			(void)sweet_i2c1_write16(addr, 0x10, 0x0002); /* soft reset may NACK */
++			(void)sapphire_fs_read(addr, 0x10, &ignored); /* vendor dummy read */
++			IOSleep(15);
++			err = sweet_i2c1_write16(addr, 0x10, 0x0001);
++			if (!err) err = sapphire_fs_read(addr, 0x0e, &init);
++			LOG("amp FS1815 0x%02x reset attempt %u init=0x%04x err=%d",
++			    addr, attempt + 1, init, err);
++			if (!err && (init == 0x0003 || init == 0x0300)) break;
++		}
 +		if (err || (init != 0x0003 && init != 0x0300)) {
 +			return err ? err : -1;
 +		}
@@ -328,7 +334,7 @@ index 6bfe1a2..05a572a 100644
  static void
  amp_on(bool on)
  {
-@@ -1504,6 +1772,18 @@ amp_on(bool on)
+@@ -1504,6 +1778,18 @@ amp_on(bool on)
  		                           { 6, 0x48 }, { 7, 0x5d }, { 8, 0x8a }, { 9, 0x0e }, { 10, 0xa4 } };
  	int err = 0;
  
