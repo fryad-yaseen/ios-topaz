@@ -1,0 +1,352 @@
+From c21199fa360eb079d47a20f9906a0c0c305327b1 Mon Sep 17 00:00:00 2001
+From: Sapphire Amp <sapphire-amp@localhost>
+Date: Fri, 23 Oct 2026 00:39:04 +0300
+Subject: [PATCH] sapphire: select speaker amp at runtime behind boot arg
+
+---
+ bsd/dev/sweet_i2c1.c            |  16 ++
+ iokit/Kernel/arm/TopazAudio.cpp | 280 ++++++++++++++++++++++++++++++++
+ 2 files changed, 296 insertions(+)
+
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index 8037ad6..116f1b0 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -16,6 +16,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_i2c1_init(void);
+ int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++int sweet_i2c1_write16(uint8_t addr, uint8_t reg, uint16_t val);
+ 
+ #define I2C1_SE_PA      0x04a84000u
+ #define I2C1_GCC_PA     0x01400000u
+@@ -187,6 +188,21 @@ sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val)
+ 	return err;
+ }
+ 
++/* FS1815: one register byte followed by a big-endian 16-bit value. */
++int
++sweet_i2c1_write16(uint8_t addr, uint8_t reg, uint16_t val)
++{
++	uint8_t tx[3] = { reg, (uint8_t)(val >> 8), (uint8_t)val };
++
++	if (!i2c1_ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_i2c1_lock);
++	int err = i2c1_msg(addr, tx, 3, NULL, 0, false);
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
+ int
+ sweet_i2c1_init(void)
+ {
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 6bfe1a2..05a572a 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1214,6 +1214,8 @@ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32
+ extern "C" bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
+ extern "C" int  sweet_i2c1_init(void);
+ extern "C" int  sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++extern "C" int  sweet_i2c1_write16(uint8_t addr, uint8_t reg, uint16_t val);
++extern "C" int  sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ static uint32_t call_token, call_op, call_words, call_rsp[16];
+@@ -1497,6 +1499,272 @@ ports_and_pa(void)
+ 	LOG("t=%u.%03u ports: rx frame b1 %08x, irq %08x", T, lr(RX_SWR + 0x105C), lr(RX_SWR + 0x200));
+ }
+ 
++/* ---------------------------------------------------------------- sapphire speaker amplifiers (sapphire_amp=1) */
++/*
++ * Sapphire DT fragment@32 puts FS1815 0x34/0x35 or AW87559 0x58/0x5b on
++ * qupv3_se1_i2c (Linux i2c0, QUP0 SE1 0x04a84000). Reset pins are GPIO105
++ * and GPIO99, both in the TLMM SOUTH tile. The tables below come from the
++ * Music and Off profiles in the exact vendor files checked by
++ * tools/extract-sapphire-amp.py:
++ * aw87xxx_acf.bin SHA256 402562f7f05ceb3e3eeb4e4160d42104116aa273000837650e149337f4b2160d
++ * fs1815.fsm      SHA256 1d520d06ab543548d8797f72801793c5a4162a88c39f32ee28c11735acdc59bc
++ * Sources: fs1815.c/fsm_core.c/fsm_i2c.c and aw87xxx_device.c in the
++ * Nikita-Projects/android_kernel_xiaomi_sm6225-modules audio-kernel tree.
++ */
++struct sapphire_reg { uint16_t reg, value; };
++static const sapphire_reg aw_music[] = {
++	{0x62,0xb5}, {0x78,0x39}, {0x79,0xe5}, {0x77,0xc1}, {0x77,0xc1},
++	{0x78,0x7a}, {0x79,0x6c}, {0x77,0x81}, {0x66,0x69}, {0x58,0xbc},
++	{0x02,0x49}, {0x03,0x0a}, {0x04,0x80}, {0x05,0x08}, {0x06,0x0a},
++	{0x07,0x85}, {0x08,0x4e}, {0x09,0x0b}, {0x0a,0x08}, {0x0b,0x4b},
++	{0x0c,0x03}, {0x0d,0x77}, {0x0e,0x7a}, {0x0f,0x51}, {0x10,0x58},
++	{0x60,0x26}, {0x61,0x15}, {0x63,0x5a}, {0x64,0xd5}, {0x65,0x57},
++	{0x67,0x28}, {0x68,0x35}, {0x69,0x98}, {0x70,0x1c}, {0x71,0x9c},
++	{0x72,0x33}, {0x73,0x40}, {0x74,0x6c}, {0x01,0x78}, {0xff,0x00}
++};
++/* AW ACF dev_index 1 is 0x58: REG 0x07=0x85. dev_index 0 is 0x5b: 0x88.
++ * The other 39 writes, including the final 0xff, are byte-for-byte equal. */
++static const sapphire_reg fs_common[] = {
++	{0xf03e,0x8500}, {0xf03f,0x8110}, {0xf04c,0x7008}, {0xf02a,0x0030},
++	{0xf058,0x827a}, {0xf059,0xd821}, {0xf05a,0xd841}, {0xf05b,0x007b},
++	{0xf05c,0x0000}, {0xf088,0xa000}, {0xf089,0x0032}, {0x44bc,0x0002},
++	{0x034c,0x0000}, {0xf0b8,0x0002}, {0xf05d,0x2005}
++};
++/* fsm reg_unit encodes [len:4, pos:4, reg:8]. The 0x0f3f and 0x0fbc
++ * Music entries have pos=15,len=0: fsm_reg_case does nothing for them. */
++static const sapphire_reg fs_music[] = {
++	{0xf020,0x1722}, {0xf022,0x0208}, {0xf023,0x0027}, {0xf018,0x000a},
++	{0xf01f,0xca91}, {0xf058,0x827a}, {0x3c59,0x0000}, {0x4019,0x000b},
++	{0xf05a,0xfcab}, {0xf01f,0x0000}
++};
++/* FS 0x35's Music 0x19 field is 0x0e; FS 0x34's is 0x0b. */
++#define SAPPHIRE_GPIO99_PA   0x00963000u
++#define SAPPHIRE_GPIO105_PA  0x00969000u
++#define SAPPHIRE_FS_ID       0x12u  /* low byte of 16-bit DEVID at 0x01 */
++#define SAPPHIRE_AW_ID       0x5au  /* AW87559 one-byte CHIPID at 0x00 */
++
++static volatile uint8_t *sapphire_gpio[2];
++static uint8_t sapphire_fs_mask, sapphire_aw_mask, sapphire_active_mask;
++static bool sapphire_probed, sapphire_playing;
++static uint8_t sapphire_fs_ready;
++static uint16_t sapphire_fs_rev[2];
++
++static void
++sapphire_reset(unsigned side, bool high)
++{
++	volatile uint8_t *base = sapphire_gpio[side];
++	*(volatile uint32_t *)(base + 4) = high ? 2u : 0u;
++	mb();
++	*(volatile uint32_t *)base = 0x200u; /* GPIO function, output, 2 mA */
++	mb();
++}
++
++static int
++sapphire_fs_read(uint8_t addr, uint8_t reg, uint16_t *value)
++{
++	uint8_t bytes[2];
++	int err = sweet_i2c1_read(addr, reg, bytes, sizeof(bytes));
++	if (err == 0) {
++		*value = (uint16_t)((bytes[0] << 8) | bytes[1]);
++	}
++	return err;
++}
++
++static int
++sapphire_fs_unit(uint8_t addr, sapphire_reg unit, uint16_t rev)
++{
++	uint8_t reg = (uint8_t)unit.reg;
++	unsigned pos = (unit.reg >> 8) & 15u, len = (unit.reg >> 12) & 15u;
++	uint16_t value = unit.value, old;
++	int err;
++
++	if (pos == 15u) {
++		return 0; /* fsm_reg_case len=0: no operation */
++	}
++	if (rev == 0x0011 && reg == 0x20 && pos == 0 && len == 15) {
++		value = 0x1b22; /* fs1815_regs_compat_v1: VOUTSEL 0x17 -> 0x1b */
++	}
++	if (rev == 0x0011 && reg >= 0x59 && reg <= 0x5c && pos == 0 && len >= 3) {
++		uint16_t low = value & 0x0fu;
++		if (low <= 2) low = low * 2 + 1;
++		else if (low <= 4) low = 6;
++		else if (low <= 9) low += 2;
++		else if (low <= 11) low = 12;
++		else low = 14;
++		value = (uint16_t)((value & ~0x0fu) | low);
++	}
++	if (pos == 0 && len == 15) {
++		return sweet_i2c1_write16(addr, reg, value);
++	}
++	err = sapphire_fs_read(addr, reg, &old);
++	if (err) {
++		return err;
++	}
++	uint16_t mask = (uint16_t)(((1u << (len + 1)) - 1u) << pos);
++	value = (uint16_t)((old & ~mask) | ((value << pos) & mask));
++	return sweet_i2c1_write16(addr, reg, value);
++}
++
++static int
++sapphire_fs_table(uint8_t addr, const sapphire_reg *table, unsigned count, uint16_t rev)
++{
++	for (unsigned i = 0; i < count; i++) {
++		sapphire_reg unit = table[i];
++		if (addr == 0x35 && unit.reg == 0x4019) unit.value = 0x000e;
++		int err = sapphire_fs_unit(addr, unit, rev);
++		if (err) {
++			LOG("amp FS1815 0x%02x reg 0x%02x failed: %d", addr, table[i].reg & 0xffu, err);
++			return err;
++		}
++	}
++	return 0;
++}
++
++static int
++sapphire_fs_start(uint8_t addr, unsigned side)
++{
++	uint16_t init = 0, rev = sapphire_fs_rev[side];
++	int err = 0;
++
++	if (!(sapphire_fs_ready & (1u << side))) {
++		(void)sweet_i2c1_write16(addr, 0x10, 0x0002); /* soft reset may NACK */
++		IOSleep(15);
++		err = sweet_i2c1_write16(addr, 0x10, 0x0001);
++		if (!err) err = sapphire_fs_read(addr, 0x0e, &init);
++		LOG("amp FS1815 0x%02x reset/init=0x%04x err=%d", addr, init, err);
++		if (err || (init != 0x0003 && init != 0x0300)) {
++			return err ? err : -1;
++		}
++		err = sapphire_fs_read(addr, 0x02, &rev);
++		if (!err) err = sweet_i2c1_write16(addr, 0x14, 0x01ca); /* tcoef 0xe5 << 1 */
++		if (!err) err = sapphire_fs_table(addr, fs_common, sizeof(fs_common) / sizeof(fs_common[0]), rev);
++		if (!err) err = sapphire_fs_table(addr, fs_music, sizeof(fs_music) / sizeof(fs_music[0]), rev);
++		LOG("amp FS1815 0x%02x common/Music rev=0x%04x err=%d", addr, rev, err);
++		if (err) return err;
++		sapphire_fs_rev[side] = rev;
++		sapphire_fs_ready |= (uint8_t)(1u << side);
++	}
++	/* The vendor fs1815_start_up sequence follows common + Music. */
++	if (rev == 0x0011) {
++		err = sweet_i2c1_write16(addr, 0xbc, 0x9433);
++	}
++	if (!err) err = sweet_i2c1_write16(addr, 0x11, 0x008f);
++	if (!err) err = sweet_i2c1_write16(addr, 0x10, 0x0000);
++	IOSleep(10);
++	LOG("amp FS1815 0x%02x power on err=%d", addr, err);
++	return err;
++}
++
++static int
++sapphire_aw_start(uint8_t addr, unsigned side)
++{
++	sapphire_reset(side, false);
++	IOSleep(2);
++	sapphire_reset(side, true);
++	IOSleep(2);
++	LOG("amp AW87559 0x%02x reset high", addr);
++	for (unsigned i = 0; i < sizeof(aw_music) / sizeof(aw_music[0]); i++) {
++		uint8_t value = (uint8_t)aw_music[i].value;
++		if (addr == 0x5b && aw_music[i].reg == 0x07) value = 0x88;
++		int err = sweet_i2c1_write(addr, (uint8_t)aw_music[i].reg, value);
++		if (err) {
++			LOG("amp AW87559 0x%02x Music reg 0x%02x failed: %d", addr, aw_music[i].reg, err);
++			return err;
++		}
++	}
++	LOG("amp AW87559 0x%02x Music on (%u writes)", addr,
++	    (unsigned)(sizeof(aw_music) / sizeof(aw_music[0])));
++	return 0;
++}
++
++static void
++sapphire_amp_on(bool on)
++{
++	static const uint8_t fs_addr[2] = {0x34, 0x35}, aw_addr[2] = {0x58, 0x5b};
++	int err;
++
++	if (!on) {
++		if (!sapphire_playing) return;
++		for (unsigned side = 0; side < 2; side++) {
++			uint8_t bit = (uint8_t)(1u << side);
++			if (!(sapphire_active_mask & bit)) continue;
++			if (sapphire_fs_mask & bit) {
++				err = sweet_i2c1_write16(fs_addr[side], 0x10, 0x0001);
++				if (!err) err = sweet_i2c1_write16(fs_addr[side], 0x11, 0x0000);
++				LOG("amp FS1815 0x%02x power off err=%d", fs_addr[side], err);
++			} else {
++				err = sweet_i2c1_write(aw_addr[side], 0x01, 0x00); /* ACF Off */
++				sapphire_reset(side, false);
++				LOG("amp AW87559 0x%02x Off/reset low err=%d", aw_addr[side], err);
++			}
++		}
++		sapphire_active_mask = 0;
++		sapphire_playing = false;
++		return;
++	}
++
++	err = sweet_i2c1_init();
++	LOG("amp sapphire I2C QUP0 SE1 init: %d", err);
++	if (err) return;
++	if (!sapphire_probed) {
++		if (!sapphire_gpio[0]) sapphire_gpio[0] = (volatile uint8_t *)ml_io_map(SAPPHIRE_GPIO105_PA, 0x1000);
++		if (!sapphire_gpio[1]) sapphire_gpio[1] = (volatile uint8_t *)ml_io_map(SAPPHIRE_GPIO99_PA, 0x1000);
++		if (!sapphire_gpio[0] || !sapphire_gpio[1]) {
++			LOG("amp sapphire TLMM SOUTH map failed");
++			return;
++		}
++		for (unsigned side = 0; side < 2; side++) sapphire_reset(side, false);
++		IOSleep(10);
++		for (unsigned side = 0; side < 2; side++) sapphire_reset(side, true);
++		IOSleep(2);
++		LOG("amp sapphire GPIO105/GPIO99 reset low 10 ms, high 2 ms");
++		for (unsigned side = 0; side < 2; side++) {
++			uint16_t fs_id = 0;
++			uint8_t aw_id = 0;
++			int fs_err = sapphire_fs_read(fs_addr[side], 0x01, &fs_id);
++			int aw_err = sweet_i2c1_read(aw_addr[side], 0x00, &aw_id, 1);
++			LOG("amp probe GPIO%u: FS 0x%02x ID=0x%04x err=%d; AW 0x%02x ID=0x%02x err=%d",
++			    side ? 99u : 105u, fs_addr[side], fs_id, fs_err, aw_addr[side], aw_id, aw_err);
++			if (!fs_err && (fs_id & 0xffu) == SAPPHIRE_FS_ID)
++				sapphire_fs_mask |= (uint8_t)(1u << side);
++			if (!aw_err && aw_id == SAPPHIRE_AW_ID)
++				sapphire_aw_mask |= (uint8_t)(1u << side);
++		}
++		if (sapphire_fs_mask && sapphire_aw_mask) {
++			LOG("amp ambiguous FS1815/AW87559 responses; refusing to start");
++			for (unsigned side = 0; side < 2; side++) sapphire_reset(side, false);
++			sapphire_fs_mask = sapphire_aw_mask = 0;
++			return;
++		}
++		if (!sapphire_fs_mask && !sapphire_aw_mask) {
++			LOG("amp no supported FS1815 or AW87559 at either address");
++			for (unsigned side = 0; side < 2; side++) sapphire_reset(side, false);
++			return;
++		}
++		sapphire_probed = true;
++		LOG("amp detected %s mask=0x%x", sapphire_fs_mask ? "FS1815" : "AW87559",
++		    sapphire_fs_mask ? sapphire_fs_mask : sapphire_aw_mask);
++	}
++	if (sapphire_playing) return;
++	for (unsigned side = 0; side < 2; side++) {
++		uint8_t bit = (uint8_t)(1u << side);
++		if (sapphire_fs_mask & bit) err = sapphire_fs_start(fs_addr[side], side);
++		else if (sapphire_aw_mask & bit) err = sapphire_aw_start(aw_addr[side], side);
++		else continue;
++		if (!err) sapphire_active_mask |= bit;
++		else if (sapphire_fs_mask & bit) {
++			(void)sweet_i2c1_write16(fs_addr[side], 0x10, 0x0001);
++			(void)sweet_i2c1_write16(fs_addr[side], 0x11, 0x0000);
++			LOG("amp FS1815 0x%02x failed start, powered off", fs_addr[side]);
++		} else {
++			sapphire_reset(side, false);
++			LOG("amp AW87559 0x%02x failed start, reset low", aw_addr[side]);
++		}
++	}
++	sapphire_playing = sapphire_active_mask != 0;
++	LOG("amp sapphire on: active mask=0x%x", sapphire_active_mask);
++}
++
+ static void
+ amp_on(bool on)
+ {
+@@ -1504,6 +1772,18 @@ amp_on(bool on)
+ 		                           { 6, 0x48 }, { 7, 0x5d }, { 8, 0x8a }, { 9, 0x0e }, { 10, 0xa4 } };
+ 	int err = 0;
+ 
++	static int sapphire_mode = -1;
++	if (sapphire_mode < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_amp", &arg, sizeof(arg));
++		sapphire_mode = arg == 1 ? 1 : 0;
++		LOG("amp sapphire_amp=%d", sapphire_mode);
++	}
++	if (sapphire_mode) {
++		sapphire_amp_on(on);
++		return;
++	}
++
+ 	if (on && !amp_init) {
+ 		err = sweet_i2c1_init();
+ 		for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]) && err == 0; i++) {
+-- 
+2.56.0
+
