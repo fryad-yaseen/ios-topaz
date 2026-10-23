@@ -1,0 +1,170 @@
+From 90dcd0fb1c5db9d84e5b8526f11e71a0b3b895e6 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 13:54:51 +0300
+Subject: [PATCH] sapphire: mirror Xiaomi FS1815 startup behind boot arg
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 73 +++++++++++++++++++++++++++------
+ 1 file changed, 61 insertions(+), 12 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index e25b366..270bb4d 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1410,6 +1410,20 @@ static const uint16_t rx_stock[][2] = {
+ static int vol_db = -30;
+ static bool codec_up, ports_up, amp_init, sapphire_route_failed;
+ 
++/* Select the complete sapphire route and the FS1815 Music startup path. */
++static bool
++sapphire_spk_xm_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_spk_xm", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_spk_xm=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ static bool
+ sapphire_spk_enabled(void)
+ {
+@@ -1420,7 +1434,7 @@ sapphire_spk_enabled(void)
+ 		enabled = arg == 1;
+ 		LOG("sapphire_spk=%d", enabled);
+ 	}
+-	return enabled != 0;
++	return enabled != 0 || sapphire_spk_xm_enabled();
+ }
+ 
+ static bool
+@@ -1433,7 +1447,7 @@ sapphire_spk_fix_enabled(void)
+ 		enabled = arg == 1;
+ 		LOG("sapphire_spk_fix=%d", enabled);
+ 	}
+-	return enabled != 0;
++	return enabled != 0 || sapphire_spk_xm_enabled();
+ }
+ 
+ static void
+@@ -1770,10 +1784,13 @@ static const sapphire_reg fs_common[] = {
+ 	{0xf05c,0x0000}, {0xf088,0xa000}, {0xf089,0x0032}, {0x44bc,0x0002},
+ 	{0x034c,0x0000}, {0xf0b8,0x0002}, {0xf05d,0x2005}
+ };
+-/* fsm reg_unit encodes [len:4, pos:4, reg:8]. The 0x0f3f and 0x0fbc
+- * Music entries have pos=15,len=0: fsm_reg_case does nothing for them. */
++/* Invariable is mode 12 and leaves the previous mode untouched. Music is
++ * mode 0, used by speaker-top and speaker-bot in the vendor mixer file.
++ * fsm reg_unit encodes [len:4, pos:4, reg:8]. Music's 0x0f3f and
++ * 0x0fbc entries clear bit 15. The original port omitted both writes. */
+ static const sapphire_reg fs_music[] = {
+ 	{0xf020,0x1722}, {0xf022,0x0208}, {0xf023,0x0027}, {0xf018,0x000a},
++	{0x0f3f,0x0000}, {0x0fbc,0x0000},
+ 	{0xf01f,0xca91}, {0xf058,0x827a}, {0x3c59,0x0000}, {0x4019,0x000b},
+ 	{0xf05a,0xfcab}, {0xf01f,0x0000}
+ };
+@@ -1814,13 +1831,16 @@ sapphire_fs_read(uint8_t addr, uint8_t reg, uint16_t *value)
+ static void
+ sapphire_fs_log_status(const char *when)
+ {
+-	static const uint8_t regs[] = { 0x00, 0x03, 0x04, 0x0e, 0x10, 0x11, 0x18, 0x20, 0x30 };
++	static const uint8_t regs[] = { 0x00, 0x03, 0x04, 0x0e, 0x10, 0x11, 0x18, 0x20, 0x30,
++	                                  0x3f, 0xbc };
+ 	for (unsigned side = 0; side < 2; side++) {
+ 		if (!(sapphire_fs_mask & (1u << side))) continue;
+ 		uint8_t addr = (uint8_t)(0x34u + side);
+ 		LOG("spk fix FS1815 0x%02x %s active=%d (00 STATUS, 03 ANASTAT, 04 DIGSTAT, 0e CHIPINI, 10 PWRCTRL, 11 SYSCTRL, 18 GAINCTRL, 20 BSTCTRL, 30 DACCTRL)",
+ 		    addr, when, !!(sapphire_active_mask & (1u << side)));
+-		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		unsigned count = sapphire_spk_xm_enabled() ?
++		    (unsigned)(sizeof(regs) / sizeof(regs[0])) : 9u;
++		for (unsigned i = 0; i < count; i++) {
+ 			uint16_t value = 0;
+ 			int err = sapphire_fs_read(addr, regs[i], &value);
+ 			LOG("spk fix FS1815 0x%02x %s reg %02x=%04x err=%d",
+@@ -1843,8 +1863,8 @@ sapphire_fs_unit(uint8_t addr, sapphire_reg unit, uint16_t rev)
+ 	uint16_t value = unit.value, old;
+ 	int err;
+ 
+-	if (pos == 15u) {
+-		return 0; /* fsm_reg_case len=0: no operation */
++	if (pos == 15u && len == 0 && !sapphire_spk_xm_enabled()) {
++		return 0; /* retain patch 1005 behavior unless Xiaomi path is selected */
+ 	}
+ 	if (rev == 0x0011 && reg == 0x20 && pos == 0 && len == 15) {
+ 		value = 0x1b22; /* fs1815_regs_compat_v1: VOUTSEL 0x17 -> 0x1b */
+@@ -1895,7 +1915,9 @@ sapphire_fs_start(uint8_t addr, unsigned side)
+ 		for (unsigned attempt = 0; attempt < 5; attempt++) {
+ 			uint16_t ignored = 0;
+ 			(void)sweet_i2c1_write16(addr, 0x10, 0x0002); /* soft reset may NACK */
+-			(void)sapphire_fs_read(addr, 0x10, &ignored); /* vendor dummy read */
++			/* The open source has a dummy read here; Xiaomi's object does not. */
++			if (!sapphire_spk_xm_enabled())
++				(void)sapphire_fs_read(addr, 0x10, &ignored);
+ 			IOSleep(15);
+ 			err = sweet_i2c1_write16(addr, 0x10, 0x0001);
+ 			if (!err) err = sapphire_fs_read(addr, 0x0e, &init);
+@@ -1912,6 +1934,23 @@ sapphire_fs_start(uint8_t addr, unsigned side)
+ 		if (!err) err = sapphire_fs_table(addr, fs_music, sizeof(fs_music) / sizeof(fs_music[0]), rev);
+ 		LOG("amp FS1815 0x%02x common/Music rev=0x%04x err=%d", addr, rev, err);
+ 		if (err) return err;
++		if (sapphire_spk_xm_enabled()) {
++			/* fsm_stub_dev_init: get_rstrim, then shut_down before start_up.
++			 * The trim is cached by Linux; this port does not use it for a write. */
++			uint16_t rstrim = 0;
++			int open_err = sweet_i2c1_write16(addr, 0x1f, 0xca91);
++			int read_err = sapphire_fs_read(addr, 0x07, &rstrim);
++			int key_err = sweet_i2c1_write16(addr, 0x1f, 0x0000);
++			LOG("amp FS1815 0x%02x OTP rstrim=0x%04x open_err=%d read_err=%d key_err=%d",
++			    addr, rstrim, open_err, read_err, key_err);
++			if (key_err) return key_err;
++			if (read_err) rstrim = 0;
++			if ((err = sweet_i2c1_write16(addr, 0x10, 0x0001)) != 0) return err;
++			if ((err = sweet_i2c1_write16(addr, 0x11, 0x0000)) != 0) return err;
++			IOSleep(10);
++			LOG("amp FS1815 0x%02x Xiaomi init shutdown; trim=%04x%s",
++			    addr, rstrim ? rstrim : 0x008fu, rstrim ? "" : " default");
++		}
+ 		sapphire_fs_rev[side] = rev;
+ 		sapphire_fs_ready |= (uint8_t)(1u << side);
+ 	}
+@@ -1987,12 +2026,22 @@ sapphire_amp_on(bool on)
+ 		for (unsigned side = 0; side < 2; side++) sapphire_reset(side, false);
+ 		IOSleep(10);
+ 		for (unsigned side = 0; side < 2; side++) sapphire_reset(side, true);
+-		IOSleep(2);
+-		LOG("amp sapphire GPIO105/GPIO99 reset low 10 ms, high 2 ms");
++		IOSleep(sapphire_spk_xm_enabled() ? 1 : 2);
++		LOG("amp sapphire GPIO105/GPIO99 reset low 10 ms, high %u ms",
++		    sapphire_spk_xm_enabled() ? 1u : 2u);
+ 		for (unsigned side = 0; side < 2; side++) {
+ 			uint16_t fs_id = 0;
+ 			uint8_t aw_id = 0;
+ 			int fs_err = sapphire_fs_read(fs_addr[side], 0x01, &fs_id);
++			if (sapphire_spk_xm_enabled() && !fs_err &&
++			    (fs_id & 0xffu) == SAPPHIRE_FS_ID) {
++				/* fsm_ext_reset in Xiaomi's probe runs before fsm_probe. */
++				int reset_err = sweet_i2c1_write16(fs_addr[side], 0x10, 0x0002);
++				IOSleep(15);
++				fs_err = sapphire_fs_read(fs_addr[side], 0x01, &fs_id);
++				LOG("amp FS1815 0x%02x probe soft reset err=%d ID=0x%04x read_err=%d",
++				    fs_addr[side], reset_err, fs_id, fs_err);
++			}
+ 			int aw_err = sweet_i2c1_read(aw_addr[side], 0x00, &aw_id, 1);
+ 			LOG("amp probe GPIO%u: FS 0x%02x ID=0x%04x err=%d; AW 0x%02x ID=0x%02x err=%d",
+ 			    side ? 99u : 105u, fs_addr[side], fs_id, fs_err, aw_addr[side], aw_id, aw_err);
+@@ -2062,7 +2111,7 @@ amp_on(bool on)
+ 		sapphire_mode = arg == 1 ? 1 : 0;
+ 		LOG("amp sapphire_amp=%d", sapphire_mode);
+ 	}
+-	if (sapphire_mode) {
++	if (sapphire_mode || sapphire_spk_xm_enabled()) {
+ 		sapphire_amp_on(on);
+ 		return;
+ 	}
+-- 
+2.56.0
+
