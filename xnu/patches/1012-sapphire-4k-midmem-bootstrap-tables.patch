@@ -1,0 +1,46 @@
+From d052874f01be40bc47eace1ccf3825a2c954bd95 Mon Sep 17 00:00:00 2001
+From: Sapphire Midmem <sapphire-midmem@local.invalid>
+Date: Fri, 23 Oct 2026 14:04:20 +0300
+Subject: [PATCH] sapphire: reserve enough 4K bootstrap tables for 7 GB midmem
+
+The 7 GB 4K bootstrap map consumes 18 table pages: two roots, seven identity L2s, eight KVA L2s, and one framebuffer L2. The previous 16-page reservation let start.s write two pages past bootstrap_pagetables before arm_vm_init, corrupting early VM state. Reserve 24 pages and compare the development sanity estimate with a page count rather than bytes.
+---
+ osfmk/arm/pmap/pmap.h     | 7 ++++---
+ osfmk/arm64/arm_vm_init.c | 2 +-
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index a2cd571..3a4a66a 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -113,10 +113,11 @@
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+ #elif defined(TOPAZ_4K)
+ /*
+- * topaz, 4 KiB pages: one L2 table maps 1 GB, so 4 GB of DRAM needs up to
+- * 5 L2 tables for V=P and 5 for the KVA (unaligned start), plus 2 L1.
++ * topaz, 4 KiB pages: one L2 table maps 1 GB. The 7 GB midmem layout
++ * uses 7 V=P and 8 KVA L2 tables, two roots, and one framebuffer L2.
++ * Leave room for the conservative arm_vm_init() bootstrap size check.
+  */
+-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 24)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b926886..26af351 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1998,7 +1998,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	size_t l1_entries = 1 + ((bytes_mapped + ARM_TT_L1_SIZE - 1) / ARM_TT_L1_SIZE);
+ 	/* 1 L1 each for V=P and KVA, plus 1 page for each L2 */
+ 	size_t pages_used = 2 * (l1_entries + 1);
+-	if (pages_used > BOOTSTRAP_TABLE_SIZE) {
++	if (pages_used > (BOOTSTRAP_TABLE_SIZE / ARM_PGBYTES)) {
+ 		panic("BOOTSTRAP_TABLE_SIZE too small for memory config");
+ 	}
+ #endif
+-- 
+2.56.0
+
