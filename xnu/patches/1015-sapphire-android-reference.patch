@@ -1,0 +1,468 @@
+From 81cf4e2c0362d66ba544f4bc3bcacbbaa924f3ae Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 15:20:08 +0300
+Subject: [PATCH] sapphire: match Android speaker and DSI command registers
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  36 +++--
+ iokit/Kernel/arm/TopazAudio.cpp       | 214 ++++++++++++++++++++++++--
+ 2 files changed, 228 insertions(+), 22 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 90f0ddc..cb4fc94 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBus
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ extern "C" void topaz_adreno_init(void);           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
++static void dsi_sapphire_ref_dump(volatile uint8_t *base);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -407,6 +408,7 @@ AppleCLCD::start(IOService *provider)
+ 		fDsiFailed = true;
+ 		IOLog("SWEET FB: sapphire DSI backlight worker unavailable\n");
+ 	}
++	if (fSapphireDsi && fDsi != NULL) dsi_sapphire_ref_dump(fDsi);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+@@ -1008,6 +1010,20 @@ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++static void
++dsi_sapphire_ref_dump(volatile uint8_t *base)
++{
++	static bool dumped;
++	if (dumped) return;
++	dumped = true;
++	for (uint32_t off = 0; off < 0x120; off += 0x10) {
++		IOLog("SWEET FB: DSI ref %03x: %08x %08x %08x %08x\n", off,
++		    dsi_rd(base, off), dsi_rd(base, off + 4), dsi_rd(base, off + 8),
++		    dsi_rd(base, off + 12));
++	}
++	IOLog("SWEET FB: DSI ref 120: %08x\n", dsi_rd(base, 0x120));
++}
++
+ bool
+ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+ {
+@@ -1081,13 +1097,16 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	return done;
+ }
+ 
+-/* The sapphire DT uses video mode, embedded DMA, LP commands and trigger_sw.
++/* The sapphire DT uses video mode, embedded HS DMA and trigger_sw.
+  * Keep the command in host RAM the 32-bit DMA offset register can address.
++ * Android's 0xfffff000 is an IOVA. The SDE DT context uses SID 0x420;
++ * this physical page depends on ABL leaving the DSI DMA stream in bypass.
+  * Only the backlight thread call enters here on sapphire.
+  */
+ bool
+ AppleCLCD::dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ {
++	if (fDsi != NULL) dsi_sapphire_ref_dump(fDsi);
+ 	if (fDsiFailed || fDsi == NULL || fDsiBuf == NULL || len > 60) {
+ 		return false;
+ 	}
+@@ -1114,16 +1133,12 @@ AppleCLCD::dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_
+ 		sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
+ 	}
+ 	uint32_t ctrl = dsi_rd(fDsi, 0x004);
+-	uint32_t trig = dsi_rd(fDsi, 0x084);
+-	uint32_t dma = dsi_rd(fDsi, 0x03c);
+-	uint32_t eot = dsi_rd(fDsi, 0x0cc);
+ 	/* The status bits are W1C. Preserve interrupt masks (odd bits). */
+ 	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & 0xaaaaaaaau) | 1u);
+-	dsi_wr(fDsi, 0x084, (trig & ~7u) | 4u);
+-	dsi_wr(fDsi, 0x004, ctrl | 5u);
+-	dsi_wr(fDsi, 0x03c, (dma & ~((1u << 24) | (1u << 29))) |
+-	    (1u << 28) | (1u << 26)); /* embedded packet header; LP */
+-	dsi_wr(fDsi, 0x0cc, eot | 1u); /* DT: qcom,mdss-dsi-tx-eot-append */
++	dsi_wr(fDsi, 0x084, 0x80000004u); /* external TE select + software DMA trigger */
++	dsi_wr(fDsi, 0x004, ctrl | 4u); /* CMD_MODE_EN only during transfer */
++	dsi_wr(fDsi, 0x03c, 0x10000000u); /* embedded packet header, HS */
++	dsi_wr(fDsi, 0x0cc, 1u); /* TX EOT append */
+ 	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
+ 	dsi_wr(fDsi, 0x04c, size);
+ 	dsi_wr(fDsi, 0x090, 1); /* DT: trigger_sw; no DMA schedule line */
+@@ -1145,10 +1160,7 @@ AppleCLCD::dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_
+ 		    dsi_rd(fDsi, 0x068), (unsigned long long)fDsiBufPhys);
+ 	}
+ 	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & 0xaaaaaaaau) | 1u);
+-	dsi_wr(fDsi, 0x0cc, eot);
+-	dsi_wr(fDsi, 0x03c, dma);
+ 	dsi_wr(fDsi, 0x004, ctrl);
+-	dsi_wr(fDsi, 0x084, trig);
+ 	return done;
+ }
+ 
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 270bb4d..6e0c5e8 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1323,6 +1323,7 @@ prm(const uint32_t *dw, uint32_t n)
+ 
+ static volatile uint8_t *lpass, *gpio92;
+ static uint32_t swr_id;
++static IOLock *sapphire_swr_lock;
+ 
+ static void
+ lw(uint32_t pa, uint32_t v)
+@@ -1344,6 +1345,7 @@ lr(uint32_t pa)
+ static bool
+ swr_rd(uint32_t master, uint32_t dev, uint32_t reg, uint8_t *value)
+ {
++	if (sapphire_swr_lock) IOLockLock(sapphire_swr_lock);
+ 	swr_id = (swr_id % 14) + 1;
+ 	uint32_t id = swr_id;
+ 	lw(master + 0x304, (1u << 24) | (dev << 20) | (id << 16) | reg);
+@@ -1352,14 +1354,17 @@ swr_rd(uint32_t master, uint32_t dev, uint32_t reg, uint8_t *value)
+ 			uint32_t result = lr(master + 0x318);
+ 			if (((result >> 8) & 0xF) == id) {
+ 				*value = (uint8_t)result;
++				if (sapphire_swr_lock) IOLockUnlock(sapphire_swr_lock);
+ 				return true;
+ 			}
+ 			LOG("sapphire spk SWR read %04x: id %u != %u, raw %08x", reg, (result >> 8) & 0xF, id, result);
++			if (sapphire_swr_lock) IOLockUnlock(sapphire_swr_lock);
+ 			return false;
+ 		}
+ 		IOSleep(1);
+ 	}
+ 	LOG("sapphire spk SWR read %04x: timeout status %08x", reg, lr(master + 0x30C));
++	if (sapphire_swr_lock) IOLockUnlock(sapphire_swr_lock);
+ 	return false;
+ }
+ 
+@@ -1367,9 +1372,11 @@ swr_rd(uint32_t master, uint32_t dev, uint32_t reg, uint8_t *value)
+ static void
+ swr_wr(uint32_t master, uint32_t dev, uint32_t reg, uint32_t val)
+ {
++	if (sapphire_swr_lock) IOLockLock(sapphire_swr_lock);
+ 	swr_id = (swr_id % 14) + 1;
+ 	lw(master + 0x300, (val << 24) | (dev << 20) | (swr_id << 16) | reg);
+ 	IOSleep(1);
++	if (sapphire_swr_lock) IOLockUnlock(sapphire_swr_lock);
+ }
+ 
+ static void
+@@ -1410,6 +1417,20 @@ static const uint16_t rx_stock[][2] = {
+ static int vol_db = -30;
+ static bool codec_up, ports_up, amp_init, sapphire_route_failed;
+ 
++/* Opt-in register comparison with Lunaris 007's active speaker route. */
++static bool
++sapphire_spk_ref_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_spk_ref", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_spk_ref=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ /* Select the complete sapphire route and the FS1815 Music startup path. */
+ static bool
+ sapphire_spk_xm_enabled(void)
+@@ -1421,7 +1442,7 @@ sapphire_spk_xm_enabled(void)
+ 		enabled = arg == 1;
+ 		LOG("sapphire_spk_xm=%d", enabled);
+ 	}
+-	return enabled != 0;
++	return enabled != 0 || sapphire_spk_ref_enabled();
+ }
+ 
+ static bool
+@@ -1517,9 +1538,83 @@ sapphire_rx_route(void)
+ 
+ static void sapphire_codec_off(void);
+ 
++struct sapphire_ref_reg { uint16_t reg; uint8_t on, idle; const char *name; };
++/* Bolero dump address = RX_MACRO offset + 0x1000. The top clocks must
++ * precede path setup; they are shut down after the WCD PAs and clocks. */
++static const sapphire_ref_reg sapphire_rx_ref[] = {
++	{0x100,0x03,0x00,"MCLK control"}, {0x104,0x01,0x02,"FS counter"},
++	{0x108,0x01,0x00,"SoundWire clock"}, {0x200,0x01,0x00,"class-H clock"},
++	{0x180,0x70,0x00,"INT0 RX2 input"}, {0x190,0x08,0x00,"INT2 RX3 input"},
++	{0x204,0x03,0x03,"class-H delay"}, {0x400,0x24,0x14,"RX0 path"},
++	{0x404,0x48,0x40,"RX0 class-H/delay"}, {0x408,0x67,0x64,"RX0 EAR select"},
++	{0x40c,0x8f,0x8c,"RX0 path cfg2"}, {0x414,0x00,0x00,"RX0 volume"},
++	{0x418,0x04,0x14,"RX0 mix path"}, {0x440,0x09,0x08,"RX0 DSM clock"},
++	{0x44c,0x00,0x00,"RX0 DSM data3"}, {0x500,0x24,0x14,"RX2 path"},
++	{0x50c,0x8f,0x8c,"RX2 path cfg2"}, {0x514,0xfc,0xfc,"RX2 volume"},
++	{0x518,0x04,0x14,"RX2 mix path"}, {0x54c,0x01,0x00,"RX2 DSM clock"},
++};
++/* 30ef, 30f0 and 31c3 are hardware status and are read only. */
++static const sapphire_ref_reg sapphire_wcd_ref[] = {
++	{0x3008,0xc3,0x02,"RX supplies"}, {0x300a,0xc0,0x40,"EAR PA"},
++	{0x300b,0x92,0x12,"EAR compander"}, {0x30a4,0x4a,0x4e,"flyback enable"},
++	{0x30a8,0x7f,0x7f,"flyback VNEG control"}, {0x30ef,0x08,0x00,"EAR status 1"},
++	{0x30f0,0xfc,0x00,"EAR status 2"}, {0x3128,0x80,0x10,"AUX PA"},
++	{0x31c3,0x08,0x00,"AUX status"}, {0x3408,0x07,0x00,"analog clocks"},
++	{0x3409,0x0d,0x08,"digital clocks"}, {0x340b,0x15,0x55,"path mode"},
++	{0x3465,0x13,0x00,"EAR PDM watchdog"}, {0x3467,0x05,0x00,"AUX PDM watchdog"},
++	{0x346c,0x5f,0xff,"interrupt mask 1"},
++};
++
++static bool
++sapphire_codec_ref_on(void)
++{
++	bool ok = true;
++	/* Bring up clock domains before enabling either digital path. */
++	for (unsigned i = 0; i < 4; i++)
++		sapphire_rx_bits(sapphire_rx_ref[i].reg, 0xffffffffu, sapphire_rx_ref[i].on, sapphire_rx_ref[i].name);
++	for (unsigned i = 4; i < sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i++) {
++		/* The stream or tone path applied its selected volume already. */
++		if (sapphire_rx_ref[i].reg == 0x414 || sapphire_rx_ref[i].reg == 0x514) continue;
++		sapphire_rx_bits(sapphire_rx_ref[i].reg, 0xffffffffu, sapphire_rx_ref[i].on, sapphire_rx_ref[i].name);
++	}
++	/* DAPM order: class-H, RX bias/supplies, clocks, RDACs, watchdog,
++	 * then EAR and AUX PAs. Hardware creates the three status values. */
++	ok &= sapphire_wcd_bits(0x30a8, 0xff, 0x7f, "class-H flyback mode");
++	ok &= sapphire_wcd_bits(0x30af, 0xe0, 0xa0, "class-H force IQ");
++	ok &= sapphire_wcd_bits(0x3099, 0x02, 0x02, "class-H mode 3");
++	ok &= sapphire_wcd_bits(0x3098, 0xff, 0x1c, "class-H mode 2 start");
++	ok &= sapphire_wcd_bits(0x30a5, 0xe0, 0xe0, "class-H flyback ctrl");
++	ok &= sapphire_wcd_bits(0x30af, 0xe0, 0xe0, "class-H VNEG DAC");
++	ok &= sapphire_wcd_bits(0x30c7, 0xff, 0xaa, "class-H flyback current");
++	ok &= sapphire_wcd_bits(0x3098, 0xff, 0x3a, "class-H buck settled");
++	ok &= sapphire_wcd_bits(0x3009, 0x0c, 0x0c, "class-AB HPH mode");
++	ok &= sapphire_wcd_bits(0x3450, 0x01, 0x00, "RDAC3 from RX1");
++	ok &= sapphire_wcd_bits(0x3008, 0xff, 0xc3, "RX/PA supplies + bias");
++	ok &= sapphire_wcd_bits(0x3408, 0xff, 0x07, "RX analog clocks");
++	ok &= sapphire_wcd_bits(0x3409, 0xff, 0x0d, "RX digital clocks");
++	ok &= sapphire_wcd_bits(0x344e, 0x04, 0x04, "EAR RDAC gain path");
++	ok &= sapphire_wcd_bits(0x344f, 0x01, 0x01, "AUX RDAC gain path");
++	ok &= sapphire_wcd_bits(0x340b, 0xff, 0x15, "AUX HP path mode");
++	ok &= sapphire_wcd_bits(0x30a4, 0xff, 0x4a, "EAR DAC flyback");
++	ok &= sapphire_wcd_bits(0x300b, 0xff, 0x92, "EAR compander/override");
++	ok &= sapphire_wcd_bits(0x3465, 0xff, 0x13, "EAR PDM watchdog");
++	ok &= sapphire_wcd_bits(0x3467, 0xff, 0x05, "AUX PDM watchdog");
++	ok &= sapphire_wcd_bits(0x346c, 0xff, 0x5f, "interrupt mask 1");
++	ok &= sapphire_wcd_bits(0x300a, 0xff, 0xc0, "EAR PA on");
++	ok &= sapphire_wcd_bits(0x3128, 0xff, 0x80, "AUX PA on");
++	IOSleep(6);
++	if (!ok) {
++		sapphire_codec_off();
++		sapphire_route_failed = true;
++		LOG("sapphire spk ref route disabled after register failure");
++	}
++	return ok;
++}
++
+ static bool
+ sapphire_codec_on(void)
+ {
++	if (sapphire_spk_ref_enabled()) return sapphire_codec_ref_on();
+ 	bool ok = true;
+ 	sapphire_rx_route();
+ 	sapphire_rx_bits(0x400, 0x20, 0x20, "INT0 EAR path on");
+@@ -1571,6 +1666,31 @@ sapphire_codec_on(void)
+ static void
+ sapphire_codec_off(void)
+ {
++	if (sapphire_spk_ref_enabled()) {
++		/* Analog PAs first, then the supply and clock domains. The amps
++		 * have already been switched off by the caller. */
++		(void)sapphire_wcd_bits(0x3128, 0xff, 0x10, "AUX PA idle");
++		(void)sapphire_wcd_bits(0x300a, 0xff, 0x40, "EAR PA idle");
++		IOSleep(7);
++		(void)sapphire_wcd_bits(0x3467, 0xff, 0x00, "AUX watchdog idle");
++		(void)sapphire_wcd_bits(0x3465, 0xff, 0x00, "EAR watchdog idle");
++		(void)sapphire_wcd_bits(0x346c, 0xff, 0xff, "interrupt mask idle");
++		(void)sapphire_wcd_bits(0x300b, 0xff, 0x12, "EAR compander idle");
++		(void)sapphire_wcd_bits(0x30a4, 0xff, 0x4e, "flyback idle");
++		(void)sapphire_wcd_bits(0x340b, 0xff, 0x55, "path mode idle");
++		(void)sapphire_wcd_bits(0x344e, 0x04, 0x00, "EAR RDAC off");
++		(void)sapphire_wcd_bits(0x344f, 0x01, 0x00, "AUX RDAC off");
++		(void)sapphire_wcd_bits(0x3409, 0xff, 0x08, "digital clocks idle");
++		(void)sapphire_wcd_bits(0x3408, 0xff, 0x00, "analog clocks idle");
++		(void)sapphire_wcd_bits(0x3008, 0xff, 0x02, "RX supplies idle");
++		(void)sapphire_wcd_bits(0x3009, 0x0c, 0x00, "class-H HPH normal");
++		(void)sapphire_wcd_bits(0x3099, 0x02, 0x00, "class-H force IQ off");
++		for (unsigned i = sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i-- > 4;)
++			sapphire_rx_bits(sapphire_rx_ref[i].reg, 0xffffffffu, sapphire_rx_ref[i].idle, sapphire_rx_ref[i].name);
++		for (unsigned i = 4; i-- > 0;)
++			sapphire_rx_bits(sapphire_rx_ref[i].reg, 0xffffffffu, sapphire_rx_ref[i].idle, sapphire_rx_ref[i].name);
++		return;
++	}
+ 	(void)sapphire_wcd_bits(0x300a, 0x80, 0x00, "EAR PA off");
+ 	(void)sapphire_wcd_bits(0x3128, 0x80, 0x00, "AUX PA off");
+ 	IOSleep(7); /* EAR DAPM POST_PMD 7 ms; AUX needs 2 ms. */
+@@ -1635,8 +1755,9 @@ codec_bringup(void)
+ 	LOG("t=%u.%03u RPM L14 on: %s", T, ok ? "OK" : "FAILED");
+ 	lpass = (volatile uint8_t *)ml_io_map(LPASS_PA, LPASS_SIZE);
+ 	gpio92 = (volatile uint8_t *)ml_io_map(TLMM_GPIO92_PA, 0x1000);
+-	if (lpass == NULL || gpio92 == NULL) {
+-		LOG("LPASS map failed");
++	if (sapphire_spk_ref_enabled()) sapphire_swr_lock = IOLockAlloc();
++	if (lpass == NULL || gpio92 == NULL || (sapphire_spk_ref_enabled() && sapphire_swr_lock == NULL)) {
++		LOG("LPASS map or SoundWire lock allocation failed");
+ 		return false;
+ 	}
+ 	/* 1. PRM: DCODEC HW vote, TX core + TX NPL clocks 19.2 MHz */
+@@ -1828,6 +1949,60 @@ sapphire_fs_read(uint8_t addr, uint8_t reg, uint16_t *value)
+ 	return err;
+ }
+ 
++static thread_call_t sapphire_ref_dump_call;
++static bool sapphire_ref_dump_started;
++
++static void
++sapphire_ref_dump(const char *when)
++{
++	for (unsigned i = 0; i < sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i++) {
++		const sapphire_ref_reg &r = sapphire_rx_ref[i];
++		uint32_t value = lr(RX_MACRO + r.reg);
++		LOG("spk ref %s RX %03x=%08x expected=%02x %s %s", when, r.reg, value,
++		    r.on, value == r.on ? "MATCH" : "DIFF", r.name);
++	}
++	for (unsigned i = 0; i < sizeof(sapphire_wcd_ref) / sizeof(sapphire_wcd_ref[0]); i++) {
++		const sapphire_ref_reg &r = sapphire_wcd_ref[i];
++		uint8_t value = 0;
++		bool read_ok = swr_rd(VA_SWR, 1, r.reg, &value);
++		LOG("spk ref %s WCD %04x=%02x expected=%02x %s %s", when, r.reg, value,
++		    r.on, !read_ok ? "READ_FAILED" : value == r.on ? "MATCH" : "DIFF", r.name);
++	}
++	for (unsigned side = 0; side < 2; side++) {
++		uint8_t addr = (uint8_t)(0x34 + side);
++		for (uint8_t reg = 3; reg <= 4; reg++) {
++			uint16_t value = 0;
++			int err = sapphire_fs_read(addr, reg, &value);
++			uint16_t expected = reg == 3 ? 0x000d : 0x7580;
++			LOG("spk ref %s FS %02x reg %02x=%04x expected=%04x %s err=%d",
++			    when, addr, reg, value, expected,
++			    err ? "READ_FAILED" : value == expected ? "MATCH" : "DIFF", err);
++		}
++	}
++}
++
++static void
++sapphire_ref_dump_delayed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	sapphire_ref_dump("+500ms");
++}
++
++static void
++sapphire_ref_dump_start(void)
++{
++	if (!sapphire_spk_ref_enabled() || sapphire_ref_dump_started) return;
++	sapphire_ref_dump_started = true;
++	sapphire_ref_dump("start");
++	sapphire_ref_dump_call = thread_call_allocate(sapphire_ref_dump_delayed, NULL);
++	if (sapphire_ref_dump_call != NULL) {
++		uint64_t deadline;
++		clock_interval_to_deadline(500, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(sapphire_ref_dump_call, deadline);
++	} else {
++		LOG("spk ref delayed dump allocation failed");
++	}
++}
++
+ static void
+ sapphire_fs_log_status(const char *when)
+ {
+@@ -1960,7 +2135,7 @@ sapphire_fs_start(uint8_t addr, unsigned side)
+ 	}
+ 	if (!err) err = sweet_i2c1_write16(addr, 0x11, 0x008f);
+ 	if (!err) err = sweet_i2c1_write16(addr, 0x10, 0x0000);
+-	IOSleep(10);
++	if (!sapphire_spk_ref_enabled()) IOSleep(10);
+ 	LOG("amp FS1815 0x%02x power on err=%d", addr, err);
+ 	return err;
+ }
+@@ -1995,7 +2170,8 @@ sapphire_amp_on(bool on)
+ 
+ 	if (!on) {
+ 		if (!sapphire_playing) return;
+-		for (unsigned side = 0; side < 2; side++) {
++		for (unsigned n = 0; n < 2; n++) {
++			unsigned side = sapphire_spk_ref_enabled() ? 1u - n : n;
+ 			uint8_t bit = (uint8_t)(1u << side);
+ 			if (!(sapphire_active_mask & bit)) continue;
+ 			if (sapphire_fs_mask & bit) {
+@@ -2067,6 +2243,8 @@ sapphire_amp_on(bool on)
+ 	}
+ 	if (sapphire_playing) return;
+ 	for (unsigned side = 0; side < 2; side++) {
++		if (side == 1 && sapphire_spk_ref_enabled() && sapphire_active_mask)
++			IOSleep(11); /* Android powers AUX about 11 ms after EAR. */
+ 		uint8_t bit = (uint8_t)(1u << side);
+ 		if (sapphire_fs_mask & bit) err = sapphire_fs_start(fs_addr[side], side);
+ 		else if (sapphire_aw_mask & bit) err = sapphire_aw_start(aw_addr[side], side);
+@@ -2085,6 +2263,7 @@ sapphire_amp_on(bool on)
+ 	LOG("amp sapphire on: active mask=0x%x", sapphire_active_mask);
+ 	if (sapphire_spk_fix_enabled() && sapphire_fs_mask) {
+ 		sapphire_fs_log_status("start");
++		if (sapphire_spk_ref_enabled()) return; /* reference dump owns the delayed I2C reads */
+ 		if (!sapphire_fs_status_call)
+ 			sapphire_fs_status_call = thread_call_allocate(sapphire_fs_log_delayed, NULL);
+ 		if (sapphire_fs_status_call) {
+@@ -2231,8 +2410,8 @@ tone_test(unsigned seconds)
+ 		ports_up = true;
+ 	}
+ 	if (sapphire_spk_enabled()) {
+-		sapphire_rx_bits(0x414, 0xff, (uint32_t)vol_db & 0xff, "tone EAR volume");
+-		sapphire_rx_bits(0x514, 0xff, (uint32_t)vol_db & 0xff, "tone AUX volume");
++		sapphire_rx_bits(0x414, 0xff, sapphire_spk_ref_enabled() ? 0u : (uint32_t)vol_db & 0xff, "tone EAR volume");
++		sapphire_rx_bits(0x514, 0xff, sapphire_spk_ref_enabled() ? 0xfcu : (uint32_t)vol_db & 0xff, "tone AUX volume");
+ 		if (!sapphire_codec_on()) {
+ 			(void)sg_cmd(APM_GRAPH_STOP);
+ 			(void)sg_cmd(APM_GRAPH_CLOSE);
+@@ -2241,13 +2420,17 @@ tone_test(unsigned seconds)
+ 		}
+ 		amp_on(true); /* FS1815 analog input is fed by the now-ready codec PAs. */
+ 		sapphire_route_dump();
++		sapphire_ref_dump_start();
+ 	} else {
+ 		amp_on(true);
+ 		lw(RX_MACRO + 0x514, (uint32_t)vol_db & 0xFF);
+ 		lw(RX_MACRO + 0x518, 0x04);
+ 		lw(RX_MACRO + 0x500, 0x24);                     /* topaz RX2 path on */
+ 	}
+-	LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
++	if (sapphire_spk_ref_enabled())
++		LOG("t=%u.%03u tone: playing %u s, EAR 0 dB AUX -4 dB", T, seconds);
++	else
++		LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
+ 	for (unsigned t = ms(); ms() - t < seconds * 1000;) {
+ 		if (!glink_poll()) {
+ 			IOSleep(2);
+@@ -2317,8 +2500,18 @@ apply_volume(void)
+ 		db = -84;
+ 	}
+ 	if (sapphire_spk_enabled()) {
+-		sapphire_rx_bits(0x414, 0xff, (uint32_t)db & 0xff, "EAR volume");
+-		sapphire_rx_bits(0x514, 0xff, (uint32_t)db & 0xff, "AUX volume");
++		if (sapphire_spk_ref_enabled()) {
++			int below = (int)(vol_below / 8);
++			int ear = vol_muted ? -84 : -below;
++			int aux = vol_muted ? -84 : -4 - below;
++			if (ear < -84) ear = -84;
++			if (aux < -84) aux = -84;
++			sapphire_rx_bits(0x414, 0xff, (uint32_t)ear & 0xff, "EAR ref volume");
++			sapphire_rx_bits(0x514, 0xff, (uint32_t)aux & 0xff, "AUX ref volume");
++		} else {
++			sapphire_rx_bits(0x414, 0xff, (uint32_t)db & 0xff, "EAR volume");
++			sapphire_rx_bits(0x514, 0xff, (uint32_t)db & 0xff, "AUX volume");
++		}
+ 	} else {
+ 		lw(RX_MACRO + 0x514, (uint32_t)db & 0xFF);  /* topaz RX2 gain */
+ 	}
+@@ -2350,6 +2543,7 @@ stream_start(void)
+ 		}
+ 		amp_on(true); /* FS1815 after EAR/AUX codec PA power-up. */
+ 		sapphire_route_dump();
++		sapphire_ref_dump_start();
+ 	} else {
+ 		amp_on(true);
+ 		apply_volume();
+-- 
+2.56.0
+
