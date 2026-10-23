@@ -1,0 +1,323 @@
+From 91b9690f81a4b7f5c5f95f7b48c2675df0f628db Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 22:39:04 +0300
+Subject: [PATCH] arm64: match sapphire Android RX SoundWire transport behind
+ boot arg
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 249 ++++++++++++++++++++++++++++++--
+ 1 file changed, 234 insertions(+), 15 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 04ab6b6..59084ad 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1431,6 +1431,20 @@ sapphire_spk_ref_enabled(void)
+ 	return enabled != 0;
+ }
+ 
++/* Reproduce the RX SoundWire transport captured on sapphire Android. */
++static bool
++sapphire_swr_ref_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_swr_ref", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_swr_ref=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ /* Select the complete sapphire route and the FS1815 Music startup path. */
+ static bool
+ sapphire_spk_xm_enabled(void)
+@@ -1770,8 +1784,9 @@ codec_bringup(void)
+ 	LOG("t=%u.%03u RPM L14 on: %s", T, ok ? "OK" : "FAILED");
+ 	lpass = (volatile uint8_t *)ml_io_map(LPASS_PA, LPASS_SIZE);
+ 	gpio92 = (volatile uint8_t *)ml_io_map(TLMM_GPIO92_PA, 0x1000);
+-	if (sapphire_spk_ref_enabled()) sapphire_swr_lock = IOLockAlloc();
+-	if (lpass == NULL || gpio92 == NULL || (sapphire_spk_ref_enabled() && sapphire_swr_lock == NULL)) {
++	bool swr_locked = sapphire_spk_ref_enabled() || sapphire_swr_ref_enabled();
++	if (swr_locked) sapphire_swr_lock = IOLockAlloc();
++	if (lpass == NULL || gpio92 == NULL || (swr_locked && sapphire_swr_lock == NULL)) {
+ 		LOG("LPASS map or SoundWire lock allocation failed");
+ 		return false;
+ 	}
+@@ -1842,11 +1857,119 @@ codec_bringup(void)
+ }
+ 
+ /* SoundWire data ports + WCD937x AUX PA, after the first graph start (ports.ps1, wcd_auxpa.ps1) */
++static void
++sapphire_swr_android_bank(unsigned bank)
++{
++	uint32_t mo = 0x40u * bank;
++	uint32_t so = 0x10u * bank;
++	/* qcom.c: port control packs channel mask, offsets, then sample interval.
++	 * Android's RX master retains a configured DP4 in both banks, although
++	 * the WCD RX slave enables only DP1. Keep that asymmetry. */
++	static const uint16_t master[][2] = {
++		{ 0x1124, 0x0003 }, { 0x1128, 0x0001 }, { 0x1130, 0 },
++		{ 0x1134, 0 }, { 0x1138, 0 }, { 0x113c, 0 },
++		{ 0x1224, 0 }, { 0x1228, 0 }, { 0x1230, 0 },
++		{ 0x1234, 0 }, { 0x1238, 0 }, { 0x123c, 0 },
++		{ 0x1424, 0x0107 }, { 0x1428, 0 }, { 0x1430, 0 },
++		{ 0x1434, 0 }, { 0x1438, 0 }, { 0x143c, 0 },
++	};
++	for (unsigned i = 0; i < sizeof(master) / sizeof(master[0]); i++) {
++		uint32_t value = master[i][1];
++		if (master[i][0] == 0x1124 || master[i][0] == 0x1424)
++			value |= 0x01000000u;
++		lw(RX_SWR + master[i][0] + mo, value);
++	}
++	/* MIPI DPn registers: +0x10 selects the other bank. DP1 uses one
++	 * channel, sample interval 3, lane 1; neither DP2 nor DP4 is enabled. */
++	static const uint8_t slave[][2] = {
++		{ 0x21, 0 }, { 0x22, 3 }, { 0x23, 0 }, { 0x24, 0 },
++		{ 0x25, 0 }, { 0x26, 0 }, { 0x27, 0 }, { 0x28, 1 },
++		{ 0x20, 1 },
++	};
++	for (unsigned i = 0; i < sizeof(slave) / sizeof(slave[0]); i++)
++		swr_wr(RX_SWR, 1, 0x100u + so + slave[i][0], slave[i][1]);
++	for (unsigned port = 2; port <= 4; port += 2) {
++		for (unsigned reg = 0x20; reg <= 0x28; reg++) {
++			uint8_t value = port == 2 && reg == 0x26 ? 0x0f : 0;
++			swr_wr(RX_SWR, 1, 0x100u * port + so + reg, value);
++		}
++	}
++}
++
++static bool
++sapphire_swr_android_switch(unsigned bank)
++{
++	/* qcom_swrm_cmd_fifo_wr_cmd uses broadcast device and command ID 15,
++	 * waits for its FIFO, then for special-command completion. This port has
++	 * no SoundWire IRQ handler, so poll FIFO drain and the bank status. */
++	if (sapphire_swr_lock) IOLockLock(sapphire_swr_lock);
++	lw(RX_SWR + 0x300, ((bank ? 0x0fu : 0x08u) << 24) |
++	    (15u << 20) | (15u << 16) | (0x60u + 0x10u * bank));
++	if (sapphire_swr_lock) IOLockUnlock(sapphire_swr_lock);
++	IOSleep(10);
++	for (unsigned i = 0; i < 90; i++) {
++		uint32_t fifo = lr(RX_SWR + 0x30c);
++		uint32_t active = lr(RX_SWR + 0x104c) & 1u;
++		if (!(fifo & 0x1f00u) && active == bank) {
++			LOG("sapphire spk SWR Android switch bank=%u FIFO=%08x IRQ=%08x", bank,
++			    fifo, lr(RX_SWR + 0x200));
++			return true;
++		}
++		IOSleep(1);
++	}
++	LOG("sapphire spk SWR Android switch timeout bank=%u FIFO=%08x active=%u IRQ=%08x",
++	    bank, lr(RX_SWR + 0x30c), lr(RX_SWR + 0x104c) & 1u,
++	    lr(RX_SWR + 0x200));
++	return false;
++}
++
++static bool
++sapphire_swr_android_ports(void)
++{
++	/* 0x112c is unbanked block length. SCP 0x44, 0x46 and 0x50-0x54
++	 * are status/identity registers, so only read them in the dump. */
++	lw(RX_SWR + 0x112c, 1);
++	lw(RX_SWR + 0x122c, 0);
++	lw(RX_SWR + 0x142c, 0);
++	swr_wr(RX_SWR, 1, 0x041, 0x04);
++	swr_wr(RX_SWR, 1, 0x045, 0x08);
++	swr_wr(RX_SWR, 1, 0x103, 0x01);
++	swr_wr(RX_SWR, 1, 0x203, 0x00);
++	swr_wr(RX_SWR, 1, 0x403, 0x00);
++	/* Linux prepares the next bank, writes its MCP frame shape, then
++	 * broadcasts its SCP frame register with command ID 15. Start from
++	 * bank 0 after swr_master_init, then mirror the resulting bank 1. */
++	unsigned current = lr(RX_SWR + 0x104c) & 1u;
++	unsigned next = current ^ 1u;
++	sapphire_swr_android_bank(next);
++	lw(RX_SWR + 0x101c + 0x40u * next, next ? 0x0005000fu : 0x002f0008u);
++	if (!sapphire_swr_android_switch(next)) return false;
++	sapphire_swr_android_bank(current);
++	lw(RX_SWR + 0x101c + 0x40u * current, current ? 0x0005000fu : 0x002f0008u);
++	/* The Android playing capture has bank 1 active. If initialization
++	 * entered with bank 1 active, repeat the normal bank switch to it. */
++	if (next != 1u) {
++		if (!sapphire_swr_android_switch(1)) return false;
++	}
++	uint8_t scp = 0;
++	bool scp_ok = swr_rd(RX_SWR, 1, 0x044, &scp);
++	LOG("sapphire spk SWR Android active bank=%u slave SCP=%02x read=%d",
++	    lr(RX_SWR + 0x104c) & 1u, scp, scp_ok);
++	return (lr(RX_SWR + 0x104c) & 1u) == 1u && scp_ok && (scp & 0x40u);
++}
++
+ static void
+ ports_and_pa(void)
+ {
+ 	static const uint32_t slv[][2] = { { 0x203, 7 }, { 0x230, 1 }, { 0x232, 0x1F }, { 0x233, 0 }, { 0x234, 0 },
+ 		                           { 0x236, 0x36 }, { 0x430, 1 }, { 0x432, 7 }, { 0x433, 0 }, { 0x434, 1 } };
++	if (sapphire_swr_ref_enabled() && sapphire_spk_enabled()) {
++		if (!sapphire_swr_android_ports()) {
++			sapphire_route_failed = true;
++			LOG("sapphire spk SWR Android bank switch failed; speaker route disabled");
++		}
++		return;
++	}
+ 	if (sapphire_spk_enabled()) {
+ 		/* WCD937x DP1 HPHL/EAR, DP2 CLSH, DP4 LO/AUX. The old
+ 		 * topaz path programs DP2 and DP4 but leaves DP1 disabled. */
+@@ -1967,21 +2090,106 @@ sapphire_fs_read(uint8_t addr, uint8_t reg, uint16_t *value)
+ static thread_call_t sapphire_ref_dump_call;
+ static bool sapphire_ref_dump_started;
+ 
++struct sapphire_swr_ref_reg { uint16_t reg; uint32_t expected; };
++
++static void
++sapphire_swr_ref_dump(const char *when)
++{
++	/* Captured while Android played a 440 Hz speaker tone. Status and FIFO
++	 * registers are snapshots, so a DIFF there need not mean bad transport. */
++	static const sapphire_swr_ref_reg master[] = {
++		{ 0x004, 3 }, { 0x008, 0 }, { 0x014, 1 },
++		{ 0x100, 0x02684026u }, { 0x104, 2 },
++		{ 0x200, 0x80000000u }, { 0x204, 0 }, { 0x208, 0 },
++		{ 0x210, 0x1fdfdu },
++		{ 0x220, 2 }, { 0x250, 0x5dfe0000u }, { 0x30c, 8 },
++		{ 0x314, 0x80000003u }, { 0x328, 8 }, { 0x344, 8 }, { 0x360, 8 },
++		{ 0x101c, 0x002f0008u }, { 0x1044, 0 }, { 0x1048, 0x003fff00u },
++		{ 0x104c, 1 }, { 0x105c, 0x0005000fu },
++		{ 0x1124, 0x01000003u }, { 0x1128, 1 }, { 0x112c, 1 },
++		{ 0x1130, 0 }, { 0x1134, 0 }, { 0x1138, 0 }, { 0x113c, 0 },
++		{ 0x1164, 0x01000003u }, { 0x1168, 1 },
++		{ 0x1170, 0 }, { 0x1174, 0 }, { 0x1178, 0 }, { 0x117c, 0 },
++		{ 0x1224, 0 }, { 0x1228, 0 }, { 0x122c, 0 },
++		{ 0x1230, 0 }, { 0x1234, 0 }, { 0x1238, 0 }, { 0x123c, 0 },
++		{ 0x1264, 0 }, { 0x1268, 0 }, { 0x1270, 0 },
++		{ 0x1274, 0 }, { 0x1278, 0 }, { 0x127c, 0 },
++		{ 0x1424, 0x01000107u }, { 0x1428, 0 }, { 0x142c, 0 },
++		{ 0x1430, 0 }, { 0x1434, 0 }, { 0x1438, 0 }, { 0x143c, 0 },
++		{ 0x1464, 0x01000107u }, { 0x1468, 0 }, { 0x1470, 0 },
++		{ 0x1474, 0 }, { 0x1478, 0 }, { 0x147c, 0 },
++	};
++	static const sapphire_swr_ref_reg slave[] = {
++		{ 0x040, 0 }, { 0x041, 4 }, { 0x044, 0x40 }, { 0x045, 8 }, { 0x046, 1 },
++		{ 0x050, 0x24 }, { 0x051, 2 }, { 0x052, 0x17 },
++		{ 0x053, 1 }, { 0x054, 0x0a },
++		{ 0x103, 1 }, { 0x120, 1 }, { 0x121, 0 }, { 0x122, 3 },
++		{ 0x123, 0 }, { 0x124, 0 }, { 0x125, 0 }, { 0x126, 0 },
++		{ 0x127, 0 }, { 0x128, 1 },
++		{ 0x130, 1 }, { 0x131, 0 }, { 0x132, 3 },
++		{ 0x133, 0 }, { 0x134, 0 }, { 0x135, 0 },
++		{ 0x136, 0 }, { 0x137, 0 }, { 0x138, 1 },
++		{ 0x220, 0 }, { 0x221, 0 }, { 0x222, 0 }, { 0x223, 0 },
++		{ 0x224, 0 }, { 0x225, 0 }, { 0x226, 0x0f },
++		{ 0x227, 0 }, { 0x228, 0 },
++		{ 0x230, 0 }, { 0x231, 0 }, { 0x232, 0 },
++		{ 0x233, 0 }, { 0x234, 0 }, { 0x235, 0 },
++		{ 0x236, 0x0f }, { 0x237, 0 }, { 0x238, 0 },
++		{ 0xf03, 1 }, { 0x2000, 1 }, { 0x2001, 3 },
++	};
++	for (unsigned i = 0; i < sizeof(master) / sizeof(master[0]); i++) {
++		const sapphire_swr_ref_reg &r = master[i];
++		uint32_t value = lr(RX_SWR + r.reg);
++		LOG("spk swr ref %s master %04x=%08x expected=%08x %s", when,
++		    r.reg, value, r.expected, value == r.expected ? "MATCH" : "DIFF");
++	}
++	for (unsigned i = 0; i < sizeof(slave) / sizeof(slave[0]); i++) {
++		const sapphire_swr_ref_reg &r = slave[i];
++		uint8_t value = 0;
++		bool ok = swr_rd(RX_SWR, 1, r.reg, &value);
++		LOG("spk swr ref %s slave %04x=%02x expected=%02x %s", when,
++		    r.reg, value, r.expected,
++		    !ok ? "READ_FAILED" : value == r.expected ? "MATCH" : "DIFF");
++	}
++	/* The supplied Android debugfs capture skips these banked SCP frame
++	 * registers, so expose their values without a fabricated comparison. */
++	for (unsigned bank = 0; bank < 2; bank++) {
++		uint16_t reg = (uint16_t)(0x060u + 0x10u * bank);
++		uint8_t value = 0;
++		bool ok = swr_rd(RX_SWR, 1, reg, &value);
++		LOG("spk swr ref %s slave SCP frame %04x=%02x %s", when,
++		    reg, value, ok ? "OBSERVED" : "READ_FAILED");
++	}
++	/* Android's slave dump omits DP4's banked registers. Their channel
++	 * enables still must stay clear; report observed values without inventing
++	 * an Android expected value for the remaining DP4 transport registers. */
++	for (unsigned bank = 0; bank < 2; bank++) {
++		uint16_t reg = (uint16_t)(0x420u + 0x10u * bank);
++		uint8_t value = 0;
++		bool ok = swr_rd(RX_SWR, 1, reg, &value);
++		LOG("spk swr ref %s slave %04x=%02x expected=00 %s (DP4 enable)", when,
++		    reg, value, !ok ? "READ_FAILED" : value == 0 ? "MATCH" : "DIFF");
++	}
++}
++
+ static void
+ sapphire_ref_dump(const char *when)
+ {
+-	for (unsigned i = 0; i < sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i++) {
+-		const sapphire_ref_reg &r = sapphire_rx_ref[i];
+-		uint32_t value = lr(RX_MACRO + r.reg);
+-		LOG("spk ref %s RX %03x=%08x expected=%02x %s %s", when, r.reg, value,
+-		    r.on, value == r.on ? "MATCH" : "DIFF", r.name);
+-	}
+-	for (unsigned i = 0; i < sizeof(sapphire_wcd_ref) / sizeof(sapphire_wcd_ref[0]); i++) {
+-		const sapphire_ref_reg &r = sapphire_wcd_ref[i];
+-		uint8_t value = 0;
+-		bool read_ok = swr_rd(VA_SWR, 1, r.reg, &value);
+-		LOG("spk ref %s WCD %04x=%02x expected=%02x %s %s", when, r.reg, value,
+-		    r.on, !read_ok ? "READ_FAILED" : value == r.on ? "MATCH" : "DIFF", r.name);
++	if (sapphire_swr_ref_enabled()) sapphire_swr_ref_dump(when);
++	if (sapphire_spk_ref_enabled()) {
++		for (unsigned i = 0; i < sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i++) {
++			const sapphire_ref_reg &r = sapphire_rx_ref[i];
++			uint32_t value = lr(RX_MACRO + r.reg);
++			LOG("spk ref %s RX %03x=%08x expected=%02x %s %s", when, r.reg, value,
++			    r.on, value == r.on ? "MATCH" : "DIFF", r.name);
++		}
++		for (unsigned i = 0; i < sizeof(sapphire_wcd_ref) / sizeof(sapphire_wcd_ref[0]); i++) {
++			const sapphire_ref_reg &r = sapphire_wcd_ref[i];
++			uint8_t value = 0;
++			bool read_ok = swr_rd(VA_SWR, 1, r.reg, &value);
++			LOG("spk ref %s WCD %04x=%02x expected=%02x %s %s", when, r.reg, value,
++			    r.on, !read_ok ? "READ_FAILED" : value == r.on ? "MATCH" : "DIFF", r.name);
++		}
+ 	}
+ 	for (unsigned side = 0; side < 2; side++) {
+ 		uint8_t addr = (uint8_t)(0x34 + side);
+@@ -2005,7 +2213,7 @@ sapphire_ref_dump_delayed(__unused thread_call_param_t p0, __unused thread_call_
+ static void
+ sapphire_ref_dump_start(void)
+ {
+-	if (!sapphire_spk_ref_enabled() || sapphire_ref_dump_started) return;
++	if ((!sapphire_spk_ref_enabled() && !sapphire_swr_ref_enabled()) || sapphire_ref_dump_started) return;
+ 	sapphire_ref_dump_started = true;
+ 	sapphire_ref_dump("start");
+ 	sapphire_ref_dump_call = thread_call_allocate(sapphire_ref_dump_delayed, NULL);
+@@ -2436,6 +2644,12 @@ tone_test(unsigned seconds)
+ 		ports_and_pa();
+ 		ports_up = true;
+ 	}
++	if (sapphire_route_failed) {
++		(void)sg_cmd(APM_GRAPH_STOP);
++		(void)sg_cmd(APM_GRAPH_CLOSE);
++		LOG("tone: sapphire SoundWire setup failed");
++		return;
++	}
+ 	if (sapphire_spk_enabled()) {
+ 		sapphire_rx_bits(0x414, 0xff, sapphire_spk_ref_enabled() ? 0u : (uint32_t)vol_db & 0xff, "tone EAR volume");
+ 		sapphire_rx_bits(0x514, 0xff, sapphire_spk_ref_enabled() ? 0xfcu : (uint32_t)vol_db & 0xff, "tone AUX volume");
+@@ -2561,6 +2775,11 @@ stream_start(void)
+ 		ports_and_pa();
+ 		ports_up = true;
+ 	}
++	if (sapphire_route_failed) {
++		(void)sg_cmd(APM_GRAPH_STOP);
++		LOG("stream: sapphire SoundWire setup failed");
++		return;
++	}
+ 	if (sapphire_spk_enabled()) {
+ 		apply_volume();
+ 		if (!sapphire_codec_on()) {
+-- 
+2.56.0
+
