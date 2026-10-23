@@ -1,0 +1,94 @@
+From 6003133b4ea606d6aa9e58d9d12da5b127bf2043 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 23 Oct 2026 14:51:00 +0300
+Subject: [PATCH] sapphire 1013: DSI command page below 4 GiB with the 4 GB
+ layout
+
+1011 needs a DSI_DMA_CMD_OFFSET (32-bit) buffer below 4 GiB; with mkadt.py --highmem the kernel has no RAM there (log: buffer 0x143f40000 unusable). Fall back to one write-combined page of the unused middle bank (0x8fffc000, below the GPU pool at 0x90000000), filled with aligned 32-bit stores.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 46 +++++++++++++++++++++++----
+ 1 file changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7bd0a11..d609915 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -94,6 +94,9 @@ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++/* sapphire: one page of the unused middle bank for DSI commands when the kernel has no RAM below 4 GiB */
++#define SAPPHIRE_DSI_LOW_PA 0x8fffc000ull     /* 16 KB aligned: 4K and 16K kernels */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -236,6 +239,7 @@ public:
+ 	volatile uint8_t *fDsi;
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
++	volatile uint32_t *fDsiLow;   /* sapphire: fixed command page below 4 GiB (4 GB layout), or NULL */
+ 	IOLock       *fBlLock;
+ 	bool          fSapphireDsi;   /* opt-in: sapphire's 32-bit command DMA */
+ 	bool          fDsiFailed;     /* stop after the first failed command */
+@@ -377,6 +381,22 @@ AppleCLCD::start(IOService *provider)
+ 		    fDsiBufPhys > 0xfffff000ull || fBlLock == NULL;
+ 		IOLog("SWEET FB: sapphire DSI DMA buffer %#llx (%s)\n",
+ 		    (unsigned long long)fDsiBufPhys, fDsiFailed ? "unusable" : "below 4 GiB");
++		/*
++		 * With the ADT's RAM only in the upper bank (mkadt.py --highmem) the kernel has no page
++		 * below 4 GiB for DSI_DMA_CMD_OFFSET (32 bits). The middle bank is RAM nobody uses below
++		 * the GPU pool (0x90000000) and the modem pool (0xe0000000): take one page of it,
++		 * write-combined, filled with aligned 32-bit stores (no cache upkeep).
++		 */
++		fDsiLow = NULL;
++		if (fDsiFailed && fDsi != NULL && fBlLock != NULL && fDsiBufPhys > 0xfffff000ull) {
++			fDsiLow = (volatile uint32_t *)ml_io_map_wcomb(SAPPHIRE_DSI_LOW_PA, 0x4000);
++			if (fDsiLow != NULL) {
++				fDsiBufPhys = SAPPHIRE_DSI_LOW_PA;
++				fDsiFailed = false;
++			}
++			IOLog("SWEET FB: sapphire DSI DMA buffer: fixed page %#llx %s\n",
++			    (unsigned long long)SAPPHIRE_DSI_LOW_PA, fDsiLow != NULL ? "mapped" : "map FAILED");
++		}
+ 	}
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+@@ -1069,14 +1089,28 @@ AppleCLCD::dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_
+ 	if (fDsiFailed || fDsi == NULL || fDsiBuf == NULL || len > 60) {
+ 		return false;
+ 	}
+-	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
+ 	uint32_t size = (4 + len + 3) & ~3u;
+-	memset(p, 0xff, 64);
+-	memcpy(p, hdr, 4);
+-	if (len) {
+-		memcpy(p + 4, payload, len);
++	if (fDsiLow != NULL) {
++		/* assembled here, then stored as aligned words into the write-combined page */
++		uint32_t words[16];
++		memset(words, 0xff, sizeof(words));
++		memcpy(words, hdr, 4);
++		if (len) {
++			memcpy((uint8_t *)words + 4, payload, len);
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			fDsiLow[i] = words[i];
++		}
++		__builtin_arm_dsb(0xf);         /* the stores reach memory before the DMA is triggered */
++	} else {
++		uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
++		memset(p, 0xff, 64);
++		memcpy(p, hdr, 4);
++		if (len) {
++			memcpy(p + 4, payload, len);
++		}
++		sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
+ 	}
+-	sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
+ 	uint32_t ctrl = dsi_rd(fDsi, 0x004);
+ 	uint32_t trig = dsi_rd(fDsi, 0x084);
+ 	uint32_t dma = dsi_rd(fDsi, 0x03c);
+-- 
+2.56.0
+
