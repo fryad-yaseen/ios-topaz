@@ -1,0 +1,385 @@
+From 4e2648a588e44814ee484f6ea081ae8b1955852f Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 22:38:54 +0300
+Subject: [PATCH] sapphire: read battery and charger state from ADSP PMIC GLINK
+
+---
+ iokit/Kernel/arm/SapphireBattmgr.h   |  17 +++
+ iokit/Kernel/arm/SapphireBattmgr.inc | 152 +++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetBattery.cpp    |  56 +++++++---
+ iokit/Kernel/arm/TopazAudio.cpp      |  15 +++
+ 4 files changed, 223 insertions(+), 17 deletions(-)
+ create mode 100644 iokit/Kernel/arm/SapphireBattmgr.h
+ create mode 100644 iokit/Kernel/arm/SapphireBattmgr.inc
+
+diff --git a/iokit/Kernel/arm/SapphireBattmgr.h b/iokit/Kernel/arm/SapphireBattmgr.h
+new file mode 100644
+index 0000000..afbcb38
+--- /dev/null
++++ b/iokit/Kernel/arm/SapphireBattmgr.h
+@@ -0,0 +1,17 @@
++/* ADSP PMIC GLINK battery sample, shared by TopazAudio and SweetBattery. */
++#ifndef SAPPHIRE_BATTMGR_H
++#define SAPPHIRE_BATTMGR_H
++#include <stdint.h>
++
++struct sapphire_batt_sample {
++	uint32_t capacity;       /* hundredths of a percent */
++	uint32_t voltage_uv;
++	int32_t current_ua;      /* positive while charging */
++	int32_t temperature;     /* hundredths of a degree C */
++	uint32_t status;         /* POWER_SUPPLY_STATUS_* */
++	uint32_t present, usb_online, usb_type;
++	uint32_t charge_uah, full_uah, cycles;
++};
++
++extern "C" bool sapphire_battmgr_sample(struct sapphire_batt_sample *out);
++#endif
+diff --git a/iokit/Kernel/arm/SapphireBattmgr.inc b/iokit/Kernel/arm/SapphireBattmgr.inc
+new file mode 100644
+index 0000000..7643e89
+--- /dev/null
++++ b/iokit/Kernel/arm/SapphireBattmgr.inc
+@@ -0,0 +1,152 @@
++/* The ADSP owns the charger. This client asks its PMIC GLINK battery manager
++ * for readings and subscribes to changes, matching qti_battery_charger.c and
++ * the HackiOS metal branch's working Topaz battery manager. */
++#define BATT_CHAN "PMIC_RTR_ADSP_APPS"
++#define BATT_OWNER 32778u
++#define BATT_GET 1u
++#define BATT_NOTIFY 2u
++#define BATT_SET_NOTIFY 4u
++#define BATT_BAT_GET 0x30u
++#define BATT_USB_GET 0x32u
++
++struct batt_wire { uint32_t owner, type, opcode, a, b, c; };
++static const struct { uint32_t opcode, property; } batt_asks[] = {
++	{ BATT_BAT_GET, 4 },  /* capacity, 0.01% */
++	{ BATT_BAT_GET, 0 },  /* status */
++	{ BATT_BAT_GET, 2 },  /* present */
++	{ BATT_BAT_GET, 7 },  /* voltage, uV */
++	{ BATT_BAT_GET, 9 },  /* current, uA */
++	{ BATT_BAT_GET, 13 }, /* Xiaomi temperature, 0.01 C */
++	{ BATT_USB_GET, 0 },  /* online */
++	{ BATT_USB_GET, 6 },  /* USB type */
++	{ BATT_BAT_GET, 15 }, /* charge counter, uAh */
++	{ BATT_BAT_GET, 18 }, /* learned full charge, uAh */
++	{ BATT_BAT_GET, 16 }, /* cycle count */
++};
++#define BATT_ASK_COUNT (sizeof(batt_asks) / sizeof(batt_asks[0]))
++#define BATT_REQUIRED ((1u << 7) - 1u)
++
++static struct {
++	bool enabled, linked, notified, active, waiting, dirty, valid;
++	unsigned index, deadline, next, seen, last_log, last_error_log;
++	uint64_t sampled_at;
++	struct sapphire_batt_sample work, latest;
++	IOLock *lock;
++} batt;
++
++extern "C" bool
++sapphire_battmgr_sample(struct sapphire_batt_sample *out)
++{
++	IOLock *lock = __atomic_load_n(&batt.lock, __ATOMIC_ACQUIRE);
++	if (!out || !lock) return false;
++	IOLockLock(lock);
++	bool valid = batt.valid;
++	uint64_t age = valid ? mach_absolute_time() - batt.sampled_at : 0, ns = 0;
++	if (valid) *out = batt.latest;
++	IOLockUnlock(lock);
++	if (valid) absolutetime_to_nanoseconds(age, &ns);
++	return valid && ns < 90000000000ull;
++}
++
++static void
++batt_rx(const uint8_t *data, uint32_t len)
++{
++	if (len < 12) return;
++	struct batt_wire m = {};
++	memcpy(&m, data, MIN(len, (uint32_t)sizeof(m)));
++	if (m.owner != BATT_OWNER) return;
++	if (m.type == BATT_NOTIFY) {
++		batt.dirty = true;
++		return;
++	}
++	if (m.type != BATT_GET || len < sizeof(m) || !batt.waiting ||
++	    m.opcode != batt_asks[batt.index].opcode || m.a != batt_asks[batt.index].property) return;
++	if (m.c == 0) {
++		batt.seen |= 1u << batt.index;
++		switch (batt.index) {
++		case 0: batt.work.capacity = m.b; break;
++		case 1: batt.work.status = m.b; break;
++		case 2: batt.work.present = m.b; break;
++		case 3: batt.work.voltage_uv = m.b; break;
++		case 4: batt.work.current_ua = (int32_t)m.b; break;
++		case 5: batt.work.temperature = (int32_t)m.b; break;
++		case 6: batt.work.usb_online = m.b; break;
++		case 7: batt.work.usb_type = m.b; break;
++		case 8: batt.work.charge_uah = m.b; break;
++		case 9: batt.work.full_uah = m.b; break;
++		case 10: batt.work.cycles = m.b; break;
++		}
++	}
++	batt.waiting = false;
++	batt.index++;
++}
++
++static void
++batt_poll(void)
++{
++	if (!batt.enabled) return;
++	if (!glink_chan_up(BATT_CHAN)) {
++		if (batt.linked) {
++			IOLockLock(batt.lock);
++			batt.valid = false;
++			IOLockUnlock(batt.lock);
++			batt.linked = false;
++		}
++		batt.notified = batt.active = batt.waiting = false;
++		return;
++	}
++	batt.linked = true;
++	unsigned now = ms();
++	if (!batt.notified) {
++		/* Android's BC_SET_NOTIFY_REQ: four zero words after the header. */
++		const uint32_t q[7] = { BATT_OWNER, BATT_NOTIFY, BATT_SET_NOTIFY, 0, 0, 0, 0 };
++		batt.notified = glink_send(BATT_CHAN, q, sizeof(q));
++		if (batt.notified) IOLog("SWEET BATTERY: ADSP notifications requested\n");
++	}
++	if (!batt.active) {
++		if (!batt.dirty && (int)(now - batt.next) < 0) return;
++		batt.dirty = false;
++		batt.active = true;
++		batt.index = batt.seen = 0;
++		bzero(&batt.work, sizeof(batt.work));
++	}
++	if (batt.waiting && (int)(now - batt.deadline) >= 0) {
++		batt.waiting = false;
++		batt.index++;
++	}
++	if (batt.waiting) return;
++	if (batt.index == BATT_ASK_COUNT) {
++		const struct sapphire_batt_sample *s = &batt.work;
++		bool good = (batt.seen & BATT_REQUIRED) == BATT_REQUIRED &&
++		    s->capacity <= 10000 && s->status >= 1 && s->status <= 4 &&
++		    s->present == 1 && s->voltage_uv >= 2800000 && s->voltage_uv <= 4600000 &&
++		    s->temperature >= -3000 && s->temperature <= 8000 && s->usb_online <= 1;
++		if (good) {
++			IOLockLock(batt.lock);
++			batt.latest = batt.work;
++			batt.sampled_at = mach_absolute_time();
++			batt.valid = true;
++			IOLockUnlock(batt.lock);
++			if (batt.last_log == 0 || (int)(now - batt.last_log) >= 30000) {
++			IOLog("SWEET BATTERY: ADSP %u.%02u%% %umV %dmA %d.%02dC status=%u external=%u type=%u charging=%u\n",
++			    s->capacity / 100, s->capacity % 100, s->voltage_uv / 1000, s->current_ua / 1000,
++			    s->temperature / 100, (s->temperature < 0 ? -s->temperature : s->temperature) % 100,
++			    s->status, s->usb_online, s->usb_type, s->status == 1);
++			batt.last_log = now;
++			}
++		} else if (batt.last_error_log == 0 || (int)(now - batt.last_error_log) >= 30000) {
++			IOLog("SWEET BATTERY: ADSP sample invalid/missing (fields %#x, capacity %u, voltage %u, temp %d)\n",
++			    batt.seen, s->capacity, s->voltage_uv, s->temperature);
++			batt.last_error_log = now;
++		}
++		batt.active = false;
++		batt.next = now + 30000;
++		return;
++	}
++	struct batt_wire q = { BATT_OWNER, BATT_GET, batt_asks[batt.index].opcode,
++	    0, batt_asks[batt.index].property, 0 };
++	if (glink_send(BATT_CHAN, &q, sizeof(q))) {
++		batt.waiting = true;
++		batt.deadline = now + 1000;
++	}
++}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index ed9a0c7..1bbb097 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include "SapphireBattmgr.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -31,12 +32,14 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fSapphire;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	    bool capable, bool charging, bool full, bool measured, bool currentValid,
++	    unsigned tempCenti = 2500, unsigned maxMah = 5020, unsigned cycles = 0,
++	    bool socEstimated = true, bool tempEstimated = true, unsigned usbType = 0);
+ 	void poll(void);
+ 	bool pollTopaz(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -57,7 +60,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fSapphire = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -105,13 +108,14 @@ SweetBattery::putBool(const char *key, bool value)
+ 
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++    bool capable, bool charging, bool full, bool measured, bool currentValid,
++    unsigned tempCenti, unsigned maxMah, unsigned cycles, bool socEstimated,
++    bool tempEstimated, unsigned usbType)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const unsigned capacity = (maxMah * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(maxMah);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -121,21 +125,21 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(cycles);
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", maxMah);
++	putNumber("DesignCapacity", maxMah);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	putNumber("Temperature", tempCenti);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatterySOCEstimated", measured && socEstimated);
++	putBool("SweetBatteryTemperatureEstimated", tempEstimated);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
++	if (fSapphire && measured) putNumber("SapphireUSBType", usbType);
+ 
+ 	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
+ 	OSDictionary *legacy = OSDictionary::withCapacity(7);
+@@ -143,7 +147,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, maxMah, mv, (UInt32)ma, cycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -160,7 +164,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (fSapphire ? "ADSP battery manager" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -372,6 +376,21 @@ SweetBattery::pollTopaz(void)
+ void
+ SweetBattery::poll(void)
+ {
++	if (fSapphire) {
++		struct sapphire_batt_sample s;
++		if (sapphire_battmgr_sample(&s)) {
++			unsigned maxMah = s.full_uah >= 4000000 && s.full_uah <= 6000000 ? s.full_uah / 1000 : 5000;
++			unsigned percent = (s.capacity + 50) / 100;
++			bool external = s.usb_online != 0;
++			publish(percent, s.voltage_uv / 1000, s.current_ua / 1000,
++			    external, external, s.status == 1, s.status == 4, true, true,
++			    (unsigned)s.temperature, maxMah, s.cycles, false, false, s.usb_type);
++			return;
++		}
++		/* No ADSP sample means cable and charge state are unknown. */
++		publish(100, 4200, 0, false, false, false, false, false, false);
++		return;
++	}
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
+@@ -438,7 +457,10 @@ SweetBattery::start(IOService *provider)
+ 	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
++	int sapphire = 0;
++	(void)PE_parse_boot_argn("sapphire_batt", &sapphire, sizeof(sapphire));
++	fSapphire = sapphire == 1;
++	fReal = fSapphire || (real == 1 && sweet_i2c1_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 04ab6b6..cdf923a 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -23,6 +23,7 @@
+ #include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
++#include "SapphireBattmgr.h"
+ 
+ #define LOG(fmt, ...)       IOLog("TopazAudio: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -874,6 +875,8 @@ glink_summary(void)
+ 	}
+ }
+ 
++#include "SapphireBattmgr.inc"
++
+ /* ---------------------------------------------------------------- QRTR + pd-mapper */
+ 
+ #define QCHAN               "IPCRTR"
+@@ -2754,6 +2757,7 @@ static void
+ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t st;
++	uint32_t sapphire_batt = 0;
+ 	unsigned last_status = 0;
+ 	bool codec_tried = false;
+ 
+@@ -2794,8 +2798,19 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	glink_register(QCHAN, qrtr_rx);
+ 	glink_register(GCHAN, gpr_rx);
++	(void)PE_parse_boot_argn("sapphire_batt", &sapphire_batt, sizeof(sapphire_batt));
++	if (sapphire_batt == 1) {
++		IOLock *lock = IOLockAlloc();
++		batt.enabled = lock != NULL;
++		if (batt.enabled) {
++			__atomic_store_n(&batt.lock, lock, __ATOMIC_RELEASE);
++			glink_register(BATT_CHAN, batt_rx);
++			IOLog("SWEET BATTERY: ADSP PMIC GLINK client enabled\n");
++		}
++	}
+ 	for (;;) {
+ 		bool busy = glink_poll();
++		batt_poll();
+ 		qrtr_poll();
+ 		gpr_poll();
+ 		stream_poll();
+-- 
+2.56.0
+
