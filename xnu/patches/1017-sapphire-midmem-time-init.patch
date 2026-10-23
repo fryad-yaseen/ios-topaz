@@ -1,0 +1,79 @@
+From: Sapphire Midmem <sapphire-midmem@local.invalid>
+Subject: [PATCH] sapphire: bypass absent RTC wait in midmem time init
+
+Trace the only call between the bsd_bufferinit and time-init return markers.
+Sapphire has no IORTC service. Skip its timed IOKit service wait when
+gpu_midmem=1, then initialize the calendar as before. Keep the highmem path
+unchanged and mark entry, the skipped wait, and calendar boundaries on the
+screen console so the next boot can distinguish a wait from a clock hang.
+---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 754b24d..e71bd9f 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -690,6 +690,9 @@ bsd_init(void)
+ 	 * Initialize the calendar.
+ 	 */
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: entering IOKitInitializeTime\n");
++#endif
+ 	IOKitInitializeTime();
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (sapphire_midmem_trace) printf("SWEET MIDMEM: IOKitInitializeTime returned\n");
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 0f71f63..b7d9b11 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -47,6 +47,8 @@
+ #include <IOKit/IOInterruptAccountingPrivate.h>
+ #include <IOKit/assert.h>
+ #include <sys/conf.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "IOKitKernelInternal.h"
+ 
+@@ -73,21 +75,40 @@ void
+ IOKitInitializeTime( void )
+ {
+ 	mach_timespec_t         t;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint32_t sapphire_midmem_trace = 0;
++	(void)PE_parse_boot_argn("gpu_midmem", &sapphire_midmem_trace, sizeof(sapphire_midmem_trace));
++#endif
+ 
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+ #ifndef BCM2837
+-	IOService::waitForService(
+-		IOService::resourceMatching("IORTC"), &t );
++	/* Sapphire's midmem layout has no RTC service. Avoid a timed IOKit wait
++	 * before the calendar is initialized; keep the highmem boot path intact. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) {
++		printf("SWEET MIDMEM: IORTC wait skipped\n");
++	} else
++#endif
++	{
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
++	}
+ #endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: entering clock_initialize_calendar\n");
++#endif
+ 	clock_initialize_calendar();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: clock_initialize_calendar returned\n");
++#endif
+ }
+ 
+ void
