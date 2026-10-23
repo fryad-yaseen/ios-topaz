@@ -1,0 +1,238 @@
+From dc59a92681faa282879cc025aad443ada7ccb470 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 18:54:51 +0300
+Subject: [PATCH] sapphire: connect CoreBrightness backlight to async DSI
+ worker
+
+Advertise BacklightMatching, expose millinits and raw brightness, and queue property writes and DCS commands off the caller. Keep the old sweetbl behavior behind its existing arg; enable this path only with sapphire_bl=1 and sapphire_dsi=1.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 125 +++++++++++++++++++++++---
+ 1 file changed, 114 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cb4fc94..3e1b17f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -89,6 +89,7 @@ sweet_hold_set(SweetSurface **set, bool on)
+ 	}
+ }
+ class AppleCLCD;
++class AppleARMBacklight;
+ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+@@ -243,12 +244,18 @@ public:
+ 	volatile uint32_t *fDsiLow;   /* sapphire: fixed command page below 4 GiB (4 GB layout), or NULL */
+ 	IOLock       *fBlLock;
+ 	bool          fSapphireDsi;   /* opt-in: sapphire's 32-bit command DMA */
++	bool          fSapphireBl;    /* opt-in: hardware brightness with CoreBrightness */
+ 	bool          fDsiFailed;     /* stop after the first failed command */
+ 	bool          fBlPowerOff;    /* power state last handled by blWork */
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
++	uint64_t      fBlNits;        /* requested 16.16 nits, including while asleep */
++	uint64_t      fBlPublishedNits;
++	uint64_t      fBlLogAt;       /* last request log in absolute time */
++	AppleARMBacklight *fBacklight;
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
++	void          queueBrightness(uint64_t nits);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	bool          dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+@@ -369,6 +376,9 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t sapphireDsi = 0;
+ 	(void)PE_parse_boot_argn("sapphire_dsi", &sapphireDsi, sizeof(sapphireDsi));
+ 	fSapphireDsi = sapphireDsi == 1;
++	uint32_t sapphireBl = 0;
++	(void)PE_parse_boot_argn("sapphire_bl", &sapphireBl, sizeof(sapphireBl));
++	fSapphireBl = sapphireBl == 1 && fSapphireDsi;
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous |
+ 	    (fSapphireDsi ? kIOMemoryMapperNone : 0), page_size, 0x00000000fffff000ull);
+@@ -402,32 +412,58 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	fBlNits = ((uint64_t)fBlLevel * SWEET_FB_MAX_NITS << 16) / 0x7ff;
++	fBlPublishedNits = fBlNits;
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fSapphireDsi && fBlCall == NULL) {
+ 		fDsiFailed = true;
+ 		IOLog("SWEET FB: sapphire DSI backlight worker unavailable\n");
+ 	}
++	if (fSapphireBl && (fDsiFailed || fBlCall == NULL)) {
++		fSapphireBl = false;
++		IOLog("SWEET FB: sapphire_bl disabled: DSI worker unavailable\n");
++	}
+ 	if (fSapphireDsi && fDsi != NULL) dsi_sapphire_ref_dump(fDsi);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+-		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+-		/*
+-		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+-		 * runs digital dimming, a colour filter over every frame, which the
+-		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+-		 */
++		setProperty("IOMFBBrightnessLevel",
++		    (unsigned long long)(fSapphireBl ? fBlNits : (200u << 16)), 32);
++		/* Keep the old sweetbl experiment separate from sapphire_bl's matched service. */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+-		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
++		AppleARMBacklight *bl = (fSapphireBl || blOn) ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+ 			bl->setProperty("backlight-control", true);
+-			bl->setProperty("brightness-nits", (unsigned long long)200, 32);
++			bl->setProperty("brightness-nits", (unsigned long long)(fSapphireBl ? fBlNits : 200), 32);
+ 			bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++			if (fSapphireBl) {
++				bl->setProperty("BrightnessMilliNits", (unsigned long long)((fBlNits * 1000) >> 16), 32);
++				bl->setProperty("rawBrightness", (unsigned long long)fBlLevel, 32);
++				bl->setProperty("maxBrightness", 0x7ffULL, 32);
++				bl->setProperty("CurrentPowerState", 1ULL, 32);
++				bl->setProperty("MaxPowerState", 1ULL, 32);
++				OSDictionary *match = OSDictionary::withCapacity(1);
++				OSDictionary *property = OSDictionary::withCapacity(1);
++				if (match != NULL && property != NULL) {
++					property->setObject("backlight-control", kOSBooleanTrue);
++					match->setObject("IOPropertyMatch", property);
++					setProperty("BacklightMatching", match);
++					setProperty("CurrentPowerState", 1ULL, 32);
++					setProperty("MaxPowerState", 1ULL, 32);
++				}
++				OSSafeReleaseNULL(property);
++				OSSafeReleaseNULL(match);
++			}
+ 			if (bl->attach(this)) {
++				if (fSapphireBl) {
++					fBacklight = bl;
++					bl->retain(); /* blWork publishes properties after start() returns */
++				}
+ 				bl->registerService();
+-				IOLog("SWEET FB: AppleARMBacklight published\n");
++				IOLog("SWEET FB: AppleARMBacklight published%s\n",
++				    fSapphireBl ? " (sapphire_bl)" : "");
+ 			}
+ 		}
+ 		OSSafeReleaseNULL(bl);
+@@ -1214,7 +1250,7 @@ AppleCLCD::setPanelLevel(uint32_t level)
+ 	bool done = dsiDcsLong(cmd, sizeof(cmd));
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+-	if (fSapphireDsi ? (done && logs++ < 8) : (logs++ < 8 || !done)) {
++	if (!fSapphireBl && (fSapphireDsi ? (done && logs++ < 8) : (logs++ < 8 || !done))) {
+ 		IOLog("SWEET FB: panel level %#x: %s\n", level, done ? "done" : "NO DONE");
+ 	}
+ }
+@@ -1228,12 +1264,16 @@ IOReturn
+ AppleCLCD::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+-	sweet_bl_log("iomfb", d);
++	if (!fSapphireBl) sweet_bl_log("iomfb", d);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
+ 	if (n == NULL || fDsi == NULL) {
+ 		return kIOReturnUnsupported;
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
++	if (fSapphireBl) {
++		queueBrightness(v);
++		return kIOReturnSuccess;
++	}
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
+ 	/* 0..SWEET_FB_MAX_NITS nits -> DT panel DBV 1..0x7ff */
+ 	uint64_t level = (v * 0x7ffull) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
+@@ -1257,17 +1297,57 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++void
++AppleCLCD::queueBrightness(uint64_t nits)
++{
++	const uint64_t max = (uint64_t)SWEET_FB_MAX_NITS << 16;
++	if (nits > max) {
++		nits = max;
++	}
++	uint32_t level = (uint32_t)((nits * 0x7ff) / max);
++	IOLockLock(fLock);
++	fBlNits = nits;
++	fBlLevel = level;
++	IOLockUnlock(fLock);
++	/* Coalesce ramps. Neither the panel command nor registry publication runs here. */
++	thread_call_enter(fBlCall);
++}
++
+ void
+ AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)p0;
+ 	IOLockLock(fb->fLock);
+ 	uint32_t level = fb->fBlLevel;
++	uint64_t nits = fb->fBlNits;
+ 	bool off = fb->fPowerOff;
+ 	IOLockUnlock(fb->fLock);
++	if (fb->fSapphireBl && nits != fb->fBlPublishedNits) {
++		fb->fBlPublishedNits = nits;
++		fb->setProperty("IOMFBBrightnessLevel", (unsigned long long)nits, 32);
++		if (fb->fBacklight != NULL) {
++			fb->fBacklight->setProperty("brightness-nits", (unsigned long long)nits, 32);
++			fb->fBacklight->setProperty("BrightnessMilliNits", (unsigned long long)((nits * 1000) >> 16), 32);
++			fb->fBacklight->setProperty("rawBrightness", (unsigned long long)level, 32);
++		}
++		uint64_t now = mach_absolute_time();
++		uint64_t elapsed = 0;
++		absolutetime_to_nanoseconds(now - fb->fBlLogAt, &elapsed);
++		if (fb->fBlLogAt == 0 || elapsed >= 1000000000ull) {
++			fb->fBlLogAt = now;
++			IOLog("SWEET FB: sapphire brightness %u/2047 (%llu mNits)\n",
++			    level, (unsigned long long)((nits * 1000) >> 16));
++		}
++	}
+ 	if (fb->fSapphireDsi && off != fb->fBlPowerOff) {
+ 		fb->fBlPowerOff = off;
+ 		fb->setPanelOn(!off);
++		if (fb->fSapphireBl && !fb->fDsiFailed) {
++			fb->setProperty("CurrentPowerState", off ? 0ULL : 1ULL, 32);
++			if (fb->fBacklight != NULL) {
++				fb->fBacklight->setProperty("CurrentPowerState", off ? 0ULL : 1ULL, 32);
++			}
++		}
+ 		if (!off) {
+ 			fb->fBlSent = ~0u; /* restore the latest level after sleep out */
+ 		}
+@@ -1302,6 +1382,29 @@ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (fFB != NULL && fFB->fSapphireBl && d != NULL) {
++		OSNumber *n = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
++		if (n != NULL) {
++			uint64_t v = n->unsigned64BitValue();
++			fFB->queueBrightness(v < 0x10000 ? v << 16 : v);
++			return kIOReturnSuccess;
++		}
++		n = OSDynamicCast(OSNumber, d->getObject("BrightnessMilliNits"));
++		if (n != NULL) {
++			uint64_t v = n->unsigned64BitValue();
++			if (v > (uint64_t)SWEET_FB_MAX_NITS * 1000) v = (uint64_t)SWEET_FB_MAX_NITS * 1000;
++			fFB->queueBrightness((v << 16) / 1000);
++			return kIOReturnSuccess;
++		}
++		n = OSDynamicCast(OSNumber, d->getObject("rawBrightness"));
++		if (n != NULL) {
++			uint64_t v = n->unsigned64BitValue();
++			if (v > 0x7ff) v = 0x7ff;
++			fFB->queueBrightness((v * SWEET_FB_MAX_NITS << 16) / 0x7ff);
++			return kIOReturnSuccess;
++		}
++		return kIOReturnSuccess;
++	}
+ 	sweet_bl_log("backlight", d);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
+ 	if (n != NULL && fFB != NULL) {
+-- 
+2.56.0
+
