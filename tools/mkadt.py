@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--qemu] [--highmem] [--amp]
 """
 import hashlib, os, struct, sys
 
@@ -49,7 +49,8 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 # an Apple artifact (kept out of git): extract it from the IPSW with
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
-D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+D22AP_ADT = os.environ.get('D22AP_ADT', os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt'))
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -76,8 +77,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, amp=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+    if amp and qemu:
+        raise ValueError('AMP topology is for the phone, not QEMU virt')
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -128,28 +131,30 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # TOPAZ SMP: only the four Cortex-A73 (gold) cores, MPIDR 0x100-0x103:
-    # the Kryo 260 Silver cores have no 16K granule, so the shim boots xnu
-    # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # Gold first: XNU assigns logical IDs by ADT order and expects the boot
+    # core, MPIDR 0x100, at logical ID 0. --amp adds Silver as the E cluster;
+    # without it the 16K Gold-only tree is unchanged. cpus=8 selects all nodes.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
-        cpu_nodes.append(node(f'cpu{core}', [
+    cpu_layout = ([(core, core, 0, 0) for core in range(1 if qemu else 4)] +
+                  ([(core + 4, core, 1, 1) for core in range(4)] if amp else []))
+    for logical, core, cluster, l2_id in cpu_layout:
+        mpidr = core if qemu or cluster == 1 else 0x100 | core
+        cluster_type = ord('P') if amp and cluster == 0 else ord('E') if amp else 0
+        cpu_nodes.append(node(f'cpu{logical}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
-            ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
-            ('die-cluster-id', u32(0)),
+            ('reg', u32(mpidr)),
+            ('cpu-id', u32(logical)),  # descriptive: XNU assigns IDs by DT order
+            ('cluster-id', u32(cluster)),  # descriptive; parser derives this from cluster-type
+            ('cluster-type', u32(cluster_type)),
+            ('die-cluster-id', u32(cluster)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(0)),  # gold L2
+            ('l2-cache-id', u32(l2_id)),
             ('l3-cache-id', u32(0)),
-            ('state', cstr('running' if core == 0 else 'stopped')),
+            ('state', cstr('running' if logical == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(1900800000 if cluster else 2803200000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -255,7 +260,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 amp='--amp' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

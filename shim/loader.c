@@ -148,7 +148,8 @@ const char *loader_boot(uintptr_t dtb)
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 
-	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
+	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours.
+	 * 16K alignment also satisfies a 4K kernel, with extra reserved slack. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);

@@ -171,21 +171,28 @@ static uintptr_t find_gicr(void);
 /*
  * topaz: xnu needs the 16K translation granule. ABL starts us on a Kryo 260
  * Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster has it.
- * The boot core wakes gold CPU 0x100 with this DTB and parks itself; gold
- * runs the loader and xnu never sees the silver cluster.
+ * The boot core wakes gold CPU 0x100 with this DTB. The normal shim parks
+ * Silver; SHIM_AMP calls PSCI CPU_OFF so XNU can CPU_ON it later.
  */
 static volatile uint64_t gold_dtb;
 static void test_gic(void);
 
 /*
- * xnu starts the other gold CPUs itself (PSCI CPU_ON), without the shim, so
+ * xnu starts the other CPUs itself (PSCI CPU_ON), without the shim, so
  * give their redistributors the same setup test_gic() gives the boot CPU:
  * awake, SGIs/PPIs in Group 1, default priority. The frames are MMIO, so the
  * boot CPU can do it for all of them.
  */
-static void gold_gicr_prepare(void)
+static void secondary_gicr_prepare(void)
 {
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+	static const uint32_t affinities[] = {
+		0x101, 0x102, 0x103,
+#ifdef SHIM_AMP
+		0x000, 0x001, 0x002, 0x003,
+#endif
+	};
+	for (unsigned cpu = 0; cpu < sizeof(affinities) / sizeof(affinities[0]); cpu++) {
+		uint32_t aff = affinities[cpu];
 		uintptr_t r = 0;
 		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
 			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
@@ -272,9 +279,15 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
 	con_skip();
-	if (((mmfr0 >> 20) & 0xf) == 0)
+#ifdef SHIM_AMP
+	if (((mmfr0 >> 28) & 0xf) == 0xf) {
+		con_str("GOLD", "no 4K granule");
+	} else {
+#else
+	if (((mmfr0 >> 20) & 0xf) == 0) {
 		con_str("GOLD", "no 16K granule here either");
-	else {
+	} else {
+#endif
 		/*
 		 * Required: without it xnu hangs after initCPU on gold (no SGI or
 		 * vtimer). It sets GICD EnableGrp1/ARE_NS, wakes gold's redistributor
@@ -282,7 +295,7 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 * be narrowed down.
 		 */
 		test_gic();
-		gold_gicr_prepare();
+		secondary_gicr_prepare();
 		gold_cpufreq_max();
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
@@ -513,6 +526,33 @@ void shim_main(uint64_t dtb)
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
 	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+#ifdef SHIM_AMP
+	uint64_t boot_mpidr = rsr("mpidr_el1") & 0xffff;
+	if (boot_mpidr == 0x100)
+		gold_main(dtb);
+	if (boot_mpidr != 0) {
+		con_hex("BOOT CPU", boot_mpidr);
+		for (;;)
+			__asm__ volatile("wfe");
+	}
+	if (((mmfr0 >> 28) & 0xf) == 0xf) {
+		con_str("SILVER", "no 4K granule");
+		for (;;)
+			__asm__ volatile("wfe");
+	}
+	con_str("SILVER", "handoff to gold CPU 0x100; then CPU_OFF");
+	silver_ticks = speed_ticks();
+	gold_dtb = dtb;
+	__asm__ volatile("dsb sy" ::: "memory");
+	int64_t amp_rc = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+	if (amp_rc == 0) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		amp_rc = smc(PSCI_CPU_OFF, 0, 0, 0);
+	}
+	con_hex("PSCI handoff", (uint64_t)amp_rc);
+	for (;;)
+		__asm__ volatile("wfe");
+#else
 	if (((mmfr0 >> 20) & 0xf) == 0) {
 		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
 		con_skip();
@@ -527,6 +567,7 @@ void shim_main(uint64_t dtb)
 		gold_dtb = 0;
 		con_hex("CPU_ON", (uint64_t)r);
 	}
+#endif
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

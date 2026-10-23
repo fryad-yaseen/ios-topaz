@@ -59,9 +59,59 @@ workflows:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
           test -s out/kernel.development.sweet
+      - name: Build 4K AMP kernel
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          # build.sh skips an existing kernel and reruns the patch loop. Build
+          # the already patched source directly, with separate object files.
+          mkdir -p out-4k
+          export TOPAZ_4K=1
+          export PATH="$(brew --prefix)/bin:$PATH"
+          export IIG="$CM_BUILD_DIR/tools/iig-pregen.sh"
+          export CC="$CC_WRAP/clang"
+          export CXX="$CC_WRAP/clang++"
+          export KERNEL_BUILD_OBJROOT="$(git -C dxb/xnu describe --tags --always)"
+          export KERNEL_BUILD_DATE="$(TZ=UTC git -C dxb/xnu log -1 --format=%cd --date=format-local:'%a %b %e %T %Z %Y')"
+          src="$CM_BUILD_DIR/dxb/xnu"
+          fakeroot="$CM_BUILD_DIR/dxb/fakeroot"
+          obj="$CM_BUILD_DIR/dxb/build/xnu-4k.obj"
+          sym="$CM_BUILD_DIR/dxb/build/xnu-4k.sym"
+          kdk=/Library/Developer/KDKs/KDK_13.5_22G74.kdk
+          test -d "$kdk"
+          memory_size=$(sysctl -n hw.memsize)
+          physical_cpus=$(sysctl -n hw.physicalcpu)
+          logical_cpus=$(sysctl -n hw.logicalcpu)
+          cd "$src"
+          make install -j8 VERBOSE=YES \
+            "CTFCONVERT=$fakeroot/usr/local/bin/ctfconvert" \
+            "CTFMERGE=$fakeroot/usr/local/bin/ctfmerge" \
+            "CTFDUMP=$fakeroot/usr/local/bin/ctfdump" \
+            SDKROOT=macosx TARGET_CONFIGS="DEVELOPMENT ARM64 SWEET" \
+            CONCISE=0 LOGCOLORS=y BUILD_WERROR=0 BUILD_LTO=0 \
+            "SRCROOT=$src" "OBJROOT=$obj" "SYMROOT=$sym" \
+            "DSTROOT=$fakeroot" "FAKEROOT_DIR=$fakeroot" "KDKROOT=$kdk" \
+            TIGHTBEAMC=tightbeamc-not-supported RC_DARWIN_KERNEL_VERSION=22.6.0 \
+            "MEMORY_SIZE=$memory_size" "SYSCTL_HW_PHYSICALCPU=$physical_cpus" \
+            "SYSCTL_HW_LOGICALCPU=$logical_cpus" \
+            KERNEL_BUILDS_IN_PARALLEL=1 2>&1 | tee "$CM_BUILD_DIR/out-4k/build.log"
+          test -s "$obj/kernel.development.sweet"
+          python3 - "$CM_BUILD_DIR" "$obj/kernel.development.sweet" <<'PY'
+          import sys
+          sys.path.insert(0, sys.argv[1] + '/tools')
+          from mkpayload import parse_macho
+          with open(sys.argv[2], 'rb') as f:
+              text = parse_macho(f.read())['segs'][0]
+          assert text['vmaddr'] == 0xfffffff007004000, 'TOPAZ_4K link address missing'
+          PY
+          cp "$obj/kernel.development.sweet" "$CM_BUILD_DIR/out-4k/"
+          (cd "$CM_BUILD_DIR/out-4k" && shasum -a 256 kernel.development.sweet > SHA256SUMS)
     artifacts:
       - out/kernel.development.sweet
       - out/SHA256SUMS
+      - out-4k/kernel.development.sweet
+      - out-4k/SHA256SUMS
+      - out-4k/build.log
   gpu-userland:
     name: GPU userland only
     instance_type: mac_mini_m2
