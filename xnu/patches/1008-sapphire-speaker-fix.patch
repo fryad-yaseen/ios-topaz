@@ -1,0 +1,117 @@
+From cfc01e544dba8d6116181315cdc9bc94ea840329 Mon Sep 17 00:00:00 2001
+From: Sapphire Audio <sapphire-audio@localhost>
+Date: Fri, 23 Oct 2026 11:33:19 +0300
+Subject: [PATCH] sapphire: set AUX HP mode and log FS1815 state
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 58 +++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index e18c817..e25b366 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -18,7 +18,9 @@
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ 
+@@ -1421,6 +1423,19 @@ sapphire_spk_enabled(void)
+ 	return enabled != 0;
+ }
+ 
++static bool
++sapphire_spk_fix_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_spk_fix", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_spk_fix=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ static void
+ sapphire_rx_bits(uint32_t reg, uint32_t mask, uint32_t value, const char *step)
+ {
+@@ -1513,6 +1528,12 @@ sapphire_codec_on(void)
+ 	ok &= sapphire_wcd_bits(0x3408, 0x07, 0x07, "RX analog clocks");
+ 	ok &= sapphire_wcd_bits(0x344e, 0x04, 0x04, "EAR RDAC gain path");
+ 	ok &= sapphire_wcd_bits(0x344f, 0x01, 0x01, "AUX RDAC gain path");
++	if (sapphire_spk_fix_enabled()) {
++		/* WCD937x AUX PATH Mode=HP_MODE: see wcd937x_aux_path_mode_put.
++		 * Clear PATH_MODE[6] and AUXPA[4] before enabling the AUX PA. */
++		ok &= sapphire_wcd_bits(0x340b, 0x40, 0x00, "AUX HP_MODE path");
++		ok &= sapphire_wcd_bits(0x3128, 0x10, 0x00, "AUX HP_MODE PA");
++	}
+ 	ok &= sapphire_wcd_bits(0x30a4, 0x04, 0x00, "EAR DAC flyback");
+ 	ok &= sapphire_wcd_bits(0x300b, 0xfc, 0x90, "EAR PA 0 dB + override");
+ 	/* DAPM PRE_PMU watchdog steps, then the analog PA switches. */
+@@ -1767,6 +1788,7 @@ static uint8_t sapphire_fs_mask, sapphire_aw_mask, sapphire_active_mask;
+ static bool sapphire_probed, sapphire_playing;
+ static uint8_t sapphire_fs_ready;
+ static uint16_t sapphire_fs_rev[2];
++static thread_call_t sapphire_fs_status_call;
+ 
+ static void
+ sapphire_reset(unsigned side, bool high)
+@@ -1789,6 +1811,30 @@ sapphire_fs_read(uint8_t addr, uint8_t reg, uint16_t *value)
+ 	return err;
+ }
+ 
++static void
++sapphire_fs_log_status(const char *when)
++{
++	static const uint8_t regs[] = { 0x00, 0x03, 0x04, 0x0e, 0x10, 0x11, 0x18, 0x20, 0x30 };
++	for (unsigned side = 0; side < 2; side++) {
++		if (!(sapphire_fs_mask & (1u << side))) continue;
++		uint8_t addr = (uint8_t)(0x34u + side);
++		LOG("spk fix FS1815 0x%02x %s active=%d (00 STATUS, 03 ANASTAT, 04 DIGSTAT, 0e CHIPINI, 10 PWRCTRL, 11 SYSCTRL, 18 GAINCTRL, 20 BSTCTRL, 30 DACCTRL)",
++		    addr, when, !!(sapphire_active_mask & (1u << side)));
++		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++			uint16_t value = 0;
++			int err = sapphire_fs_read(addr, regs[i], &value);
++			LOG("spk fix FS1815 0x%02x %s reg %02x=%04x err=%d",
++			    addr, when, regs[i], value, err);
++		}
++	}
++}
++
++static void
++sapphire_fs_log_delayed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	sapphire_fs_log_status("+500ms");
++}
++
+ static int
+ sapphire_fs_unit(uint8_t addr, sapphire_reg unit, uint16_t rev)
+ {
+@@ -1988,6 +2034,18 @@ sapphire_amp_on(bool on)
+ 	}
+ 	sapphire_playing = sapphire_active_mask != 0;
+ 	LOG("amp sapphire on: active mask=0x%x", sapphire_active_mask);
++	if (sapphire_spk_fix_enabled() && sapphire_fs_mask) {
++		sapphire_fs_log_status("start");
++		if (!sapphire_fs_status_call)
++			sapphire_fs_status_call = thread_call_allocate(sapphire_fs_log_delayed, NULL);
++		if (sapphire_fs_status_call) {
++			uint64_t deadline;
++			clock_interval_to_deadline(500, kMillisecondScale, &deadline);
++			thread_call_enter_delayed(sapphire_fs_status_call, deadline);
++		} else {
++			LOG("spk fix FS1815 delayed status call allocation failed");
++		}
++	}
+ }
+ 
+ static void
+-- 
+2.56.0
+
