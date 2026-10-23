@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 6e0c5e8..04ab6b6 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1445,6 +1445,21 @@ sapphire_spk_xm_enabled(void)
+ 	return enabled != 0 || sapphire_spk_ref_enabled();
+ }
+ 
++/* fs1815_start_up calls fsm_config_vol after PWRCTRL. Test that missing
++ * write independently of the existing speaker route boot arguments. */
++static bool
++sapphire_fs_vol_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_fs_vol", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_fs_vol=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ static bool
+ sapphire_spk_enabled(void)
+ {
+@@ -2135,6 +2150,18 @@ sapphire_fs_start(uint8_t addr, unsigned side)
+ 	}
+ 	if (!err) err = sweet_i2c1_write16(addr, 0x11, 0x008f);
+ 	if (!err) err = sweet_i2c1_write16(addr, 0x10, 0x0000);
++	if (!err && sapphire_fs_vol_enabled()) {
++		uint16_t before = 0, after = 0;
++		int before_err = sapphire_fs_read(addr, 0x06, &before);
++		/* The stock fs1815_start_up calls fsm_config_vol here. Its
++		 * default cfg->volume is capped at 0xff, then shifted by 8. */
++		err = sweet_i2c1_write16(addr, 0x06, 0xff00);
++		int after_err = err ? err : sapphire_fs_read(addr, 0x06, &after);
++		LOG("amp FS1815 0x%02x VOLCTRL 06 old=%04x old_err=%d new=%04x read_err=%d",
++		    addr, before, before_err, after, after_err);
++		if (!err && after_err) err = after_err;
++		if (!err && after != 0xff00) err = -1;
++	}
+ 	if (!sapphire_spk_ref_enabled()) IOSleep(10);
+ 	LOG("amp FS1815 0x%02x power on err=%d", addr, err);
+ 	return err;
