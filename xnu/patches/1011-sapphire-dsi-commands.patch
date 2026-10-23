@@ -1,0 +1,224 @@
+From 213b9b443ed7d7887b8109bfa81bd0bd3dac273e Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 14:05:59 +0300
+Subject: [PATCH] sapphire: use host low memory for DSI command DMA
+
+The command buffer in testB was at 0x143f28000, but DSI_DMA_CMD_OFFSET is a 32-bit register. The old physical mask constrained an IOVA while getPhysicalSegment(..., kIOMemoryMapperNone) returned the high host PA. Allocate with kIOMemoryMapperNone so the mask applies to host RAM and reject any non-addressable result.
+
+Keep the panel DT embedded LP software-trigger settings, use its 0x7ff two-byte DBV format, and run power commands on the backlight worker. Latch and log one timeout after a bounded wait.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 115 ++++++++++++++++++++++++--
+ 1 file changed, 110 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d3ee17..7bd0a11 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -237,12 +237,16 @@ public:
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
++	bool          fSapphireDsi;   /* opt-in: sapphire's 32-bit command DMA */
++	bool          fDsiFailed;     /* stop after the first failed command */
++	bool          fBlPowerOff;    /* power state last handled by blWork */
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
++	bool          dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+ 	void          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -357,13 +361,30 @@ AppleCLCD::start(IOService *provider)
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	uint32_t sapphireDsi = 0;
++	(void)PE_parse_boot_argn("sapphire_dsi", &sapphireDsi, sizeof(sapphireDsi));
++	fSapphireDsi = sapphireDsi == 1;
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous |
++	    (fSapphireDsi ? kIOMemoryMapperNone : 0), page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
++	fDsiFailed = false;
++	fBlPowerOff = false;
++	if (fSapphireDsi) {
++		/* DSI_DMA_CMD_OFFSET is 32 bits. Do not silently truncate a host PA. */
++		fDsiFailed = fDsi == NULL || fDsiBufPhys == 0 ||
++		    fDsiBufPhys > 0xfffff000ull || fBlLock == NULL;
++		IOLog("SWEET FB: sapphire DSI DMA buffer %#llx (%s)\n",
++		    (unsigned long long)fDsiBufPhys, fDsiFailed ? "unusable" : "below 4 GiB");
++	}
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
++	if (fSapphireDsi && fBlCall == NULL) {
++		fDsiFailed = true;
++		IOLog("SWEET FB: sapphire DSI backlight worker unavailable\n");
++	}
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+@@ -978,6 +999,9 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+ bool
+ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ {
++	if (fSapphireDsi) {
++		return dsiSendSapphire(hdr, payload, len);
++	}
+ 	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
+ 		return false;
+ 	}
+@@ -1035,6 +1059,63 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	return done;
+ }
+ 
++/* The sapphire DT uses video mode, embedded DMA, LP commands and trigger_sw.
++ * Keep the command in host RAM the 32-bit DMA offset register can address.
++ * Only the backlight thread call enters here on sapphire.
++ */
++bool
++AppleCLCD::dsiSendSapphire(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
++{
++	if (fDsiFailed || fDsi == NULL || fDsiBuf == NULL || len > 60) {
++		return false;
++	}
++	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
++	uint32_t size = (4 + len + 3) & ~3u;
++	memset(p, 0xff, 64);
++	memcpy(p, hdr, 4);
++	if (len) {
++		memcpy(p + 4, payload, len);
++	}
++	sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
++	uint32_t ctrl = dsi_rd(fDsi, 0x004);
++	uint32_t trig = dsi_rd(fDsi, 0x084);
++	uint32_t dma = dsi_rd(fDsi, 0x03c);
++	uint32_t eot = dsi_rd(fDsi, 0x0cc);
++	/* The status bits are W1C. Preserve interrupt masks (odd bits). */
++	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & 0xaaaaaaaau) | 1u);
++	dsi_wr(fDsi, 0x084, (trig & ~7u) | 4u);
++	dsi_wr(fDsi, 0x004, ctrl | 5u);
++	dsi_wr(fDsi, 0x03c, (dma & ~((1u << 24) | (1u << 29))) |
++	    (1u << 28) | (1u << 26)); /* embedded packet header; LP */
++	dsi_wr(fDsi, 0x0cc, eot | 1u); /* DT: qcom,mdss-dsi-tx-eot-append */
++	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	dsi_wr(fDsi, 0x04c, size);
++	dsi_wr(fDsi, 0x090, 1); /* DT: trigger_sw; no DMA schedule line */
++	bool done = false;
++	for (unsigned i = 0; i < 100 && !done; i++) {
++		done = (dsi_rd(fDsi, 0x110) & 1u) != 0;
++		if (!done) {
++			IODelay(200); /* at most 20 ms, on blWork */
++		}
++	}
++	if (!done) {
++		uint32_t status = dsi_rd(fDsi, 0x008);
++		uint32_t ints = dsi_rd(fDsi, 0x110);
++		fDsiFailed = true;
++		IOLog("SWEET FB: sapphire DSI cmd %#x failed once: ctrl %#x trig %#x dma %#x int %#x (video_done=%u) status %#x (cmd=%u dma=%u mdp=%u video=%u dsi=%u other=%#x) ack_err %#x buf %#llx\n",
++		    hdr[0], dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x084), dsi_rd(fDsi, 0x03c), ints,
++		    !!(ints & 0x10000u), status, !!(status & 1u), !!(status & 2u),
++		    !!(status & 4u), !!(status & 8u), !!(status & 16u), status & ~31u,
++		    dsi_rd(fDsi, 0x068), (unsigned long long)fDsiBufPhys);
++	}
++	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & 0xaaaaaaaau) | 1u);
++	dsi_wr(fDsi, 0x0cc, eot);
++	dsi_wr(fDsi, 0x03c, dma);
++	dsi_wr(fDsi, 0x004, ctrl);
++	dsi_wr(fDsi, 0x084, trig);
++	return done;
++}
++
+ /*
+  * Panel power as the Linux panel drivers do it: off = brightness 0, DCS 0x28
+  * display off, 0x10 sleep in (0x28 alone left the topaz AMOLED showing the
+@@ -1044,6 +1125,9 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
++	if (fSapphireDsi && fDsiFailed) {
++		return;
++	}
+ 	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
+ 	uint8_t second[4] = { (uint8_t)(on ? 0x29 : 0x10), 0, 0x05, 0x80 };
+ 	bool done = true;
+@@ -1053,10 +1137,16 @@ AppleCLCD::setPanelOn(bool on)
+ 	IOLockLock(fBlLock);
+ 	done &= dsiSend(first, NULL, 0);
+ 	IOLockUnlock(fBlLock);
++	if (fSapphireDsi && !done) {
++		return;
++	}
+ 	IOSleep(on ? 120 : 20);
+ 	IOLockLock(fBlLock);
+ 	done &= dsiSend(second, NULL, 0);
+ 	IOLockUnlock(fBlLock);
++	if (fSapphireDsi && !done) {
++		return;
++	}
+ 	if (!on) {
+ 		IOSleep(120);
+ 	}
+@@ -1067,12 +1157,16 @@ AppleCLCD::setPanelOn(bool on)
+ void
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
+-	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
++	if (fSapphireDsi && fDsiFailed) {
++		return;
++	}
++	/* Sapphire M7/N7 DT: 0x7ff max and inverted DBV, hence two bytes MSB first. */
++	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
+ 	IOLockLock(fBlLock);
+ 	bool done = dsiDcsLong(cmd, sizeof(cmd));
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+-	if (logs++ < 8 || !done) {
++	if (fSapphireDsi ? (done && logs++ < 8) : (logs++ < 8 || !done)) {
+ 		IOLog("SWEET FB: panel level %#x: %s\n", level, done ? "done" : "NO DONE");
+ 	}
+ }
+@@ -1093,7 +1187,7 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
+-	/* 0..SWEET_FB_MAX_NITS nits -> DBV 1..0x7ff */
++	/* 0..SWEET_FB_MAX_NITS nits -> DT panel DBV 1..0x7ff */
+ 	uint64_t level = (v * 0x7ffull) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
+ 	if (level > 0x7ff) {
+ 		level = 0x7ff;
+@@ -1123,6 +1217,13 @@ AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	uint32_t level = fb->fBlLevel;
+ 	bool off = fb->fPowerOff;
+ 	IOLockUnlock(fb->fLock);
++	if (fb->fSapphireDsi && off != fb->fBlPowerOff) {
++		fb->fBlPowerOff = off;
++		fb->setPanelOn(!off);
++		if (!off) {
++			fb->fBlSent = ~0u; /* restore the latest level after sleep out */
++		}
++	}
+ 	if (!off && level != fb->fBlSent) {
+ 		fb->fBlSent = level;
+ 		fb->setPanelLevel(level);
+@@ -1603,7 +1704,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
+ 			if (changed && fFB->fDsi != NULL) {
+-				if (off) {
++				if (fFB->fSapphireDsi) {
++					if (fFB->fBlCall != NULL) {
++						thread_call_enter(fFB->fBlCall);
++					}
++				} else if (off) {
+ 					fFB->setPanelOn(false);
+ 				} else {
+ 					fFB->setPanelOn(true);
+-- 
+2.56.0
+
