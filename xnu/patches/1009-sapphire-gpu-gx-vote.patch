@@ -1,0 +1,168 @@
+From a35368c6bc47d10fe97ef9bc84c12b24fe1c3d0c Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Fri, 23 Oct 2026 12:44:29 +0300
+Subject: [PATCH] sapphire: vote GPU CX level before clocks above 600 MHz
+
+The khaje GPU GX and CX GDSCs both use VDD_CX_LEVEL. Vote rwcx/0 vlvl through the existing TopazRpm GLINK client, in active and sleep sets, before selecting a faster gfx3d parent. Require gpu_vote=1; on a failed vote or PLL setup, select the known-good 600 MHz GPLL0 source.
+
+Vendor khaje GPU levels: 785 NOM (0x100), 1025 TURBO (0x180), 1114.8/1260 TURBO_L1 (0x1a0). Rates between vendor OPPs use the next higher level.
+
+Sources: https://android.googlesource.com/kernel/msm-extra/devicetree/+/refs/heads/android-msm-redbull-4.19-android13-qpr2-beta/qcom/khaje.dtsi
+
+https://github.com/MakrSas/topaz-woa/blob/main/drivers/TopazRpm/driver.c
+
+https://github.com/torvalds/linux/blob/master/drivers/pmdomain/qcom/rpmpd.c
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 82 ++++++++++++++++++++++++++++----
+ 1 file changed, 73 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..3420a55 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -14,8 +14,8 @@
+  *
+  * Boot-arg gpu=1: a thread waits for the root filesystem, loads the firmware
+  * (/usr/share/firmware/topaz/{a610_zap.mdt,a610_zap.b02,a630_sqe.fw}), starts
+- * the GPU and publishes the RedwoodGPU service. gpu_mhz=600 runs the core at
+- * 600 MHz instead of 300.
++ * the GPU and publishes the RedwoodGPU service. gpu_mhz selects a clock rate;
++ * gpu_vote=1 opts into an RPM CX level vote before rates above 600 MHz.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+@@ -34,6 +34,7 @@ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+ void RedwoodGPUStart(void);
+ void topaz_adreno_init(void);
++bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ extern const uint8_t topaz_fw_zap_mdt[], topaz_fw_zap_b02[], topaz_fw_sqe_fw[];
+ extern const size_t topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size, topaz_fw_sqe_fw_size;
+ 
+@@ -101,7 +102,7 @@ uint32_t gpu_log;
+ #define FW_DIR              "/usr/share/firmware/topaz/"
+ 
+ static volatile uint8_t *gcc, *gpucc, *gpu, *smmu;
+-static bool ready, failed, smmu_on;
++static bool ready, failed, smmu_on, gpu_vote;
+ static uint32_t wptr, seqno, core_mhz = 300;
+ static IOLock *hw_lock;
+ 
+@@ -365,8 +366,9 @@ kbuf_alloc_high(struct kbuf *b, uint64_t size)
+ 
+ /*
+  * Zonda PLL at GPU CC + 0, sequence from the stock khaje kernel (gpucc-khaje.c, clk-alpha-pll.c):
+- * f = 19.2 MHz * (L + alpha / 2^16) at the stock OPPs. The GX voltage corner is not voted (RPM):
+- * high rates run on whatever the bootloader left and may hang (gpu_mhz is opt-in).
++ * f = 19.2 MHz * (L + alpha / 2^16) at the stock clock rates. Above 600 MHz,
++ * gpu_vote=1 requests the matching CX level; otherwise the old opt-in gpu_mhz
++ * behavior still relies on the bootloader's rail level.
+  */
+ #define ZP_MODE        0x00
+ #define ZP_L           0x04
+@@ -432,6 +434,51 @@ gpu_pll_start(uint32_t mhz)
+ 	return true;
+ }
+ 
++/*
++ * khaje's GPU GDSCs both have VDD_CX_LEVEL as parent, not an RPM RWGX
++ * resource. Vote the shared CX rail through the existing rpm_requests client.
++ * 820/980 and 1100 MHz are PLL table rates between vendor GPU power levels;
++ * round each up to the next vendor level. The RPM also has a separate MX
++ * domain, but neither GPU GDSC lists it as a supply.
++ * Sources: Qualcomm khaje.dtsi and topaz-woa docs/P8_gpu.md.
++ */
++#define RPM_RWCX        0x78637772u             /* "rwcx" */
++#define RPM_VLVL        0x6c766c76u             /* "vlvl" */
++
++static uint32_t
++gpu_cx_level(uint32_t mhz)
++{
++	switch (mhz) {
++	case 785: return 0x100;                    /* NOM */
++	case 820:                                 /* ceiling: 1025 MHz TURBO */
++	case 980:
++	case 1025: return 0x180;                   /* TURBO */
++	case 1100:                                /* ceiling: 1114.8 MHz TURBO_L1 */
++	case 1260: return 0x1a0;                   /* TURBO_L1 */
++	default: return 0;
++	}
++}
++
++static bool
++gpu_vote_cx(uint32_t mhz)
++{
++	uint32_t level = gpu_cx_level(mhz);
++
++	if (level == 0) {
++		IOLog("TopazGPU: no CX level for %u MHz\n", mhz);
++		return false;
++	}
++	for (uint32_t set = 0; set <= 1; set++) {   /* active and sleep, as stock qcom,set = 3 */
++		bool ack = topaz_rpm_write(set, RPM_RWCX, 0, RPM_VLVL, level);
++		IOLog("TopazGPU: CX rwcx/0 vlvl=%03x for %u MHz set %u: RPM %s\n",
++		    level, mhz, set, ack ? "ack" : "failed");
++		if (!ack) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ /* ---------------------------------------------------------------- power (TopazGpuW PowerUp) */
+ 
+ static bool
+@@ -511,14 +558,29 @@ power_up(void)
+ 		IOLog("TopazGPU: GX GDSC: no PWR_ON\n");
+ 		return false;
+ 	}
+-	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other stock OPPs from gpu_cc_pll0 (the GX corner is not voted) */
++	/* Vote the shared GX/CX supply before switching gfx3d above the known-good 600 MHz. */
++	if (gpu_vote && core_mhz > 600 && !gpu_vote_cx(core_mhz)) {
++		IOLog("TopazGPU: CX vote failed; falling back to 600 MHz\n");
++		core_mhz = 600;
++	}
++	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other rates from gpu_cc_pll0. */
+ 	if (core_mhz != 300 && core_mhz != 600 && gpu_pll_start(core_mhz)) {
+ 		if (!rcg_set(0x101c, 1, 1)) {                   /* parent 1 = GPU_CC_PLL0_OUT_MAIN */
+-			return false;
++			if (!gpu_vote) {
++				return false;
++			}
++			IOLog("TopazGPU: GPU PLL clock switch failed; falling back to 600 MHz\n");
++			core_mhz = 600;
++			if (!rcg_set(0x101c, SRC_GPLL0, 1)) {
++				return false;
++			}
+ 		}
+ 	} else {
+ 		if (core_mhz != 300 && core_mhz != 600) {
+-			core_mhz = 300;
++			if (gpu_vote) {
++				IOLog("TopazGPU: GPU PLL failed; falling back to 600 MHz\n");
++			}
++			core_mhz = gpu_vote ? 600 : 300;
+ 		}
+ 		if (!rcg_set(0x101c, SRC_GPLL0, core_mhz >= 600 ? 1 : 2)) {
+ 			return false;
+@@ -1211,7 +1273,7 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+ void
+ topaz_adreno_init(void)
+ {
+-	uint32_t on = 0, mhz = 0;
++	uint32_t on = 0, mhz = 0, vote = 0;
+ 	thread_t thread;
+ 
+ 	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0 || hw_lock != NULL) {
+@@ -1222,6 +1284,8 @@ topaz_adreno_init(void)
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
+ 		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
+ 	}
++	(void)PE_parse_boot_argn("gpu_vote", &vote, sizeof(vote));
++	gpu_vote = vote == 1;
+ 	hw_lock = IOLockAlloc();
+ 	if (kernel_thread_start(topaz_adreno_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-- 
+2.56.0
+
