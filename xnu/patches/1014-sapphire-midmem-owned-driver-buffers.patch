@@ -1,0 +1,281 @@
+From b6810ad534fe0d2aed2d83ef33d6c4766e470b5d Mon Sep 17 00:00:00 2001
+From: Sapphire Midmem <sapphire-midmem@local.invalid>
+Date: Fri, 23 Oct 2026 14:58:00 +0300
+Subject: [PATCH] sapphire: allocate midmem driver buffers from owned RAM
+
+The midmem ADT gives XNU 0x80000000..0x240000000, overlapping the fixed GPU pool, modem/ADSP pool and DSI fallback page. Keep the highmem fixed pools, but use physically contiguous, wired IOBMD memory below 4 GiB for midmem clients and retain ownership through subrange mappings. Gate the DSI fixed page to highmem and add boot milestones after buffer initialization.
+---
+ bsd/kern/bsd_init.c                   | 11 ++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 12 +++--
+ iokit/Kernel/arm/TopazAdreno.cpp      | 78 +++++++++++++++++++++++++--
+ iokit/Kernel/arm/TopazModem.cpp       | 31 +++++++++--
+ 4 files changed, 119 insertions(+), 13 deletions(-)
+
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..754b24d 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -680,16 +680,27 @@ bsd_init(void)
+ 	 */
+ 	bsd_init_kprintf("calling bsd_bufferinit\n");
+ 	bsd_bufferinit();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint32_t sapphire_midmem_trace = 0;
++	(void)PE_parse_boot_argn("gpu_midmem", &sapphire_midmem_trace, sizeof(sapphire_midmem_trace));
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: bsd_bufferinit returned\n");
++#endif
+ 
+ 	/*
+ 	 * Initialize the calendar.
+ 	 */
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
+ 	IOKitInitializeTime();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: IOKitInitializeTime returned\n");
++#endif
+ 
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sapphire_midmem_trace) printf("SWEET MIDMEM: vfsinit returned\n");
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d609915..90f0ddc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -382,13 +382,15 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: sapphire DSI DMA buffer %#llx (%s)\n",
+ 		    (unsigned long long)fDsiBufPhys, fDsiFailed ? "unusable" : "below 4 GiB");
+ 		/*
+-		 * With the ADT's RAM only in the upper bank (mkadt.py --highmem) the kernel has no page
+-		 * below 4 GiB for DSI_DMA_CMD_OFFSET (32 bits). The middle bank is RAM nobody uses below
+-		 * the GPU pool (0x90000000) and the modem pool (0xe0000000): take one page of it,
+-		 * write-combined, filled with aligned 32-bit stores (no cache upkeep).
++		 * With --highmem the kernel has no page below 4 GiB for DSI_DMA_CMD_OFFSET.
++		 * The fixed page is safe only there. Under --midmem it belongs to XNU, so
++		 * use the IOBMD allocation or leave DSI commands disabled.
+ 		 */
+ 		fDsiLow = NULL;
+-		if (fDsiFailed && fDsi != NULL && fBlLock != NULL && fDsiBufPhys > 0xfffff000ull) {
++		uint32_t gpuMidmem = 0;
++		(void)PE_parse_boot_argn("gpu_midmem", &gpuMidmem, sizeof(gpuMidmem));
++		if (!gpuMidmem && fDsiFailed && fDsi != NULL && fBlLock != NULL &&
++		    fDsiBufPhys > 0xfffff000ull) {
+ 			fDsiLow = (volatile uint32_t *)ml_io_map_wcomb(SAPPHIRE_DSI_LOW_PA, 0x4000);
+ 			if (fDsiLow != NULL) {
+ 				fDsiBufPhys = SAPPHIRE_DSI_LOW_PA;
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 3420a55..393ecca 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -19,6 +19,7 @@
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/thread.h>
+@@ -222,16 +223,37 @@ range_alloc(void *table, unsigned *count, uint64_t size)
+  * unaligned accesses there were SIGBUS). The kIOMapWriteCombineCache option of
+  * the mapping alone does not change it.
+  */
++/* boot-arg gpu_midmem=1: the ADT gives the kernel RAM below 4 GiB (mkadt.py --midmem), GPU memory is the kernel's */
++static uint32_t gpu_midmem;
++/* Keep ownership of every midmem allocation while GPU and userspace map its PA. */
++static IOLock *midmem_pool_lock;
++static struct {
++	uint64_t pa, size;
++	IOBufferMemoryDescriptor *owner;
++} midmem_pool[2048];
++
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+ IOMemoryDescriptor *
+ topaz_gpu_pool_md(uint64_t pa, uint64_t size)
+ {
++	if (gpu_midmem) {
++		if (midmem_pool_lock == NULL) return NULL;
++		IOLockLock(midmem_pool_lock);
++		IOMemoryDescriptor *md = NULL;
++		for (unsigned i = 0; i < 2048; i++) {
++			if (midmem_pool[i].owner != NULL && pa >= midmem_pool[i].pa &&
++			    size <= midmem_pool[i].size && pa - midmem_pool[i].pa <= midmem_pool[i].size - size) {
++				md = IOSubMemoryDescriptor::withSubRange(midmem_pool[i].owner,
++				    pa - midmem_pool[i].pa, size, kIODirectionInOut);
++				break;
++			}
++		}
++		IOLockUnlock(midmem_pool_lock);
++		return md;
++	}
+ 	return IOMemoryDescriptor::withAddressRange(pa, size,
+ 	           kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
+ }
+-
+-/* boot-arg gpu_midmem=1: the ADT gives the kernel RAM below 4 GiB (mkadt.py --midmem), GPU memory is the kernel's */
+-static uint32_t gpu_midmem;
+ extern "C" bool topaz_gpu_midmem(void);
+ bool
+ topaz_gpu_midmem(void)
+@@ -250,6 +272,37 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT) {
+ 		return 0;
+ 	}
++	if (gpu_midmem) {
++		if (midmem_pool_lock == NULL) return 0;
++		IOBufferMemoryDescriptor *owner = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
++		    size, 0x00000000fffff000ull);
++		if (owner == NULL) return 0;
++		pa = owner->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		if (pa == 0 || pa + size > 0x100000000ull) {
++			owner->release();
++			return 0;
++		}
++		void *bytes = owner->getBytesNoCopy();
++		if (bytes == NULL) {
++			owner->release();
++			return 0;
++		}
++		IOLockLock(midmem_pool_lock);
++		for (unsigned i = 0; i < 2048; i++) {
++			if (midmem_pool[i].owner == NULL) {
++				midmem_pool[i].pa = pa;
++				midmem_pool[i].size = size;
++				midmem_pool[i].owner = owner;
++				IOLockUnlock(midmem_pool_lock);
++				if (va != NULL) *va = bytes;
++				return pa;
++			}
++		}
++		IOLockUnlock(midmem_pool_lock);
++		owner->release();
++		return 0;
++	}
+ 	if (!gpu_pool_ready) {
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+ 		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
+@@ -287,6 +340,22 @@ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ void
+ topaz_gpu_pool_free(uint64_t pa, uint64_t size)
+ {
++	if (gpu_midmem) {
++		if (midmem_pool_lock == NULL) return;
++		size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
++		IOLockLock(midmem_pool_lock);
++		for (unsigned i = 0; i < 2048; i++) {
++			if (midmem_pool[i].owner != NULL && midmem_pool[i].pa == pa && midmem_pool[i].size == size) {
++				IOBufferMemoryDescriptor *owner = midmem_pool[i].owner;
++				midmem_pool[i].owner = NULL;
++				IOLockUnlock(midmem_pool_lock);
++				owner->release();
++				return;
++			}
++		}
++		IOLockUnlock(midmem_pool_lock);
++		return;
++	}
+ 	pool_give_back(pa, size);
+ }
+ 
+@@ -876,7 +945,7 @@ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ 	unsigned at;
+ 
+ 	if (gpu_identity) {
+-		pool_give_back(address, size);  /* GPU address = physical: the buffer's pool memory */
++		topaz_gpu_pool_free(address, size);  /* an owned midmem buffer or the fixed pool */
+ 		return;
+ 	}
+ 	size = (size + 0xffff) & ~0xffffull;
+@@ -1281,6 +1350,7 @@ topaz_adreno_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
++	if (gpu_midmem) midmem_pool_lock = IOLockAlloc();
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
+ 		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
+ 	}
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f76ffd3..14fe557 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -17,6 +17,7 @@
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -83,6 +84,8 @@ struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
+ static uint8_t *smem;                           /* write-combined */
+ static volatile uint8_t *apcs, *tcsr_mutex;     /* device */
+ static uint8_t *pool;
++static uint64_t pool_base = MODEM_POOL_BASE;
++static IOBufferMemoryDescriptor *pool_owner;
+ static uint64_t pool_used;
+ /*
+  * TopazAudio (adsp=1) shares SMEM, the APCS doorbell, SCM, the pool and the firmware reader
+@@ -119,7 +122,7 @@ pool_alloc(uint64_t size, uint64_t *pa)
+ 		IOLockUnlock(soc_lock);
+ 		return NULL;
+ 	}
+-	*pa = MODEM_POOL_BASE + pool_used;
++	*pa = pool_base + pool_used;
+ 	void *va = pool + pool_used;
+ 	pool_used += size;
+ 	IOLockUnlock(soc_lock);
+@@ -6277,6 +6280,8 @@ topaz_soc_map(void)
+ 	soc_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
+ 	uint8_t probe[16];
++	uint32_t midmem = 0;
++	(void)PE_parse_boot_argn("gpu_midmem", &midmem, sizeof(midmem));
+ 	int err = EAGAIN;
+ 	for (int i = 0; i < 120 && err == EAGAIN; i++) {
+ 		err = sweet_ufs_read_part(fw_part, fw_files[0].off, probe, sizeof(probe));
+@@ -6285,16 +6290,34 @@ topaz_soc_map(void)
+ 		}
+ 	}
+ 	smem_map = err == 0 ? map_phys(SMEM_PA, SMEM_SIZE, true) : NULL;
+-	pool_map = err == 0 ? map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true) : NULL;
++	pool_map = err == 0 && !midmem ? map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true) : NULL;
++	if (err == 0 && midmem) {
++		/* The fixed pool belongs to XNU under --midmem. Keep these pages wired
++		 * while TrustZone, the modem and the ADSP use their physical addresses. */
++		pool_owner = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
++		    MODEM_POOL_SIZE, 0x00000000fffff000ull);
++		if (pool_owner != NULL) {
++			pool_base = pool_owner->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++			if (pool_base == 0 || pool_base + MODEM_POOL_SIZE > 0xf0000000ull ||
++			    pool_owner->getBytesNoCopy() == NULL) {
++				pool_owner->release();
++				pool_owner = NULL;
++			}
++		}
++	}
+ 	apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
+ 	tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, 0x4000);
+ 	if (err != 0) {
+ 		LOG("partition %s: %d", fw_part, err);
+-	} else if (smem_map == NULL || pool_map == NULL || apcs == NULL || tcsr_mutex == NULL || soc_lock == NULL) {
++	} else if (smem_map == NULL || (midmem ? pool_owner == NULL : pool_map == NULL) ||
++	    apcs == NULL || tcsr_mutex == NULL || soc_lock == NULL) {
+ 		LOG("mappings failed");
+ 	} else {
+ 		smem = (uint8_t *)smem_map->getVirtualAddress();
+-		pool = (uint8_t *)pool_map->getVirtualAddress();
++		pool = midmem ? (uint8_t *)pool_owner->getBytesNoCopy() : (uint8_t *)pool_map->getVirtualAddress();
++		LOG("pool %#llx+%#llx (%s)", pool_base, (uint64_t)MODEM_POOL_SIZE,
++		    midmem ? "kernel-owned" : "fixed");
+ 		state = 1;
+ 	}
+ 	IOLockUnlock(once);
+-- 
+2.56.0
+
