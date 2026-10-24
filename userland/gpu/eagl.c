@@ -307,7 +307,7 @@ struct eagl {
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
-	uint64_t gl_us, gl_t0, frames_on_p, frames_on_e;     /* topaz: time inside GL calls; the core the frame ended on */
+	uint64_t gl_us, gl_t0, frame_gl_us, draw_us, upload_us, frames_on_p, frames_on_e;
 	unsigned most_calls, most_triangles;
 	const char *sources[64];        /* the text of the shaders being made, by name modulo this */
 	bool fragment[64];              /* ... and which of the two kinds each is */
@@ -408,6 +408,18 @@ eagl_leave(struct eagl *e, unsigned offset)
 		uint64_t dt = now_us() - e->gl_t0;
 		if (e->in_frame) {
 			e->gl_us += dt;
+			e->frame_gl_us += dt;
+			/* The wrapper already times each call. Reuse that sample for a frame breakdown. */
+			switch (offset) {
+			case 0x0210: case 0x0220: case 0x0cb0: case 0x17d8: case 0x17e0:
+				e->draw_us += dt;
+				break;
+			case 0x0970: case 0x09a0: case 0x0be0: case 0x0be8:
+			case 0x0bf8: case 0x0c00: case 0x0db8: case 0x0dc0:
+			case 0x1438: case 0x1440:
+				e->upload_us += dt;
+				break;
+			}
 		}
 		slot_us[offset / 8] += dt;
 	}
@@ -1093,6 +1105,9 @@ frame_end(struct eagl *e, bool finished)
 		e->most_triangles = e->triangles;
 	}
 	if (e->frames <= 40 || e->frames % 20 == 0) {
+		say("redwood-gl: frame %u GL calls: draw %llu us, upload %llu us, other %llu us\n",
+		    e->frames, e->draw_us, e->upload_us, e->frame_gl_us >= e->draw_us + e->upload_us ?
+		    e->frame_gl_us - e->draw_us - e->upload_us : 0);
 		say("redwood-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
 		    "out), %llu before it for the IOSurfaces; flush %llu us/%u, end blit %llu, end flush %llu us/%u, "
@@ -1113,6 +1128,7 @@ frame_end(struct eagl *e, bool finished)
 	e->upload_bytes = e->attaching = e->flushing = 0;
 	e->end_blit_us = e->end_flush_us = e->end_sync_us = e->end_surface_us = 0;
 	e->flushes = e->end_flushes = 0;
+	e->frame_gl_us = e->draw_us = e->upload_us = 0;
 }
 
 #ifndef GL_BLEND
