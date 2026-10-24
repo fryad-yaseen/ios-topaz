@@ -1,0 +1,174 @@
+From 51771b0c913c301244c284b02bb24f72c93c0750 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 09:45:59 +0300
+Subject: [PATCH] sapphire: use readable INTF1 counters for bounded scan timing
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 88 ++++++++-------------------
+ 1 file changed, 26 insertions(+), 62 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5f99bbb..35ef41c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -197,19 +197,17 @@ public:
+ 	uint64_t      fVLockAt;
+ 	uint32_t      fPanelUS;       /* a panel frame, measured */
+ 	uint32_t      vsyncNext(void);
+-	/* sapphire_scan=1: Khaje display clocks and INTF_1's actual scan. */
+-	volatile uint32_t *fScanGcc, *fScanDispcc;
++	/* sapphire_scan=1: INTF_1 measured scan. */
+ 	bool          fScanRequested;
+ 	volatile bool fScanEnabled;
+ 	uint32_t      fScanLines, fScanShown, fScanDiv, fScanRate;
+-	uint32_t      fScanMilliHz, fScanLastFrame;
++	uint32_t      fScanMilliHz, fScanLastFrame, fScanSameReads;
+ 	uint64_t      fScanLineNS, fScanFrameNS;
+ 	bool          scanStart(void);
+ 	bool          scanUnavailable(void);
+ 	bool          scanRead(uint32_t *frame, uint32_t *line);
+ 	uint32_t      scanNextUS(void);
+ 	uint32_t      scanTimerUS(void);
+-	void          scanWaitLatch(void);
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+@@ -594,7 +592,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fScanEnabled) {
+ 		uint32_t frame, line;
+ 		if (fb->scanRead(&frame, &line)) {
+-			if (frame == fb->fScanLastFrame || frame % fb->fScanDiv != 0) {
++			if (frame == fb->fScanLastFrame) {
++				if (++fb->fScanSameReads >= 3) {
++					fb->fScanEnabled = false;
++					IOLog("SWEET FB: INTF_1 counter stopped; using 60 Hz timer\n");
++				} else {
++					sender->setTimeoutUS(fb->scanTimerUS());
++					return;
++				}
++			} else {
++				fb->fScanSameReads = 0;
++				}
++			if (fb->fScanEnabled && frame % fb->fScanDiv != 0) {
+ 				sender->setTimeoutUS(fb->scanTimerUS());
+ 				return;
+ 			}
+@@ -760,29 +769,20 @@ AppleCLCD::vsyncNext(void)
+ 	return next;
+ }
+ 
+-/* Khaje: GCC at 0x01400000, DISPCC at 0x05f00000, MDSS INTF_1 at 0x05e6b800.
+- * The clock offsets come from gcc-khaje.c and dispcc-khaje.c; the GDSCR is
+- * the qcom,gdsc@5f03000 node in Sapphire's live device tree. Never read
+- * INTF_1 after either bus clock or the display power gate goes away. */
++/* INTF_1 is already mapped and read by the existing diagnostic path. Keep
++ * this sample bounded: a display reset may stop the counter between reads. */
+ bool
+ AppleCLCD::scanRead(uint32_t *frame, uint32_t *line)
+ {
+-	if (fScanGcc == NULL || fScanDispcc == NULL || fIntf1 == NULL ||
+-	    !(fScanGcc[(SAPPHIRE_GCC_DISP_AHB & 0xfff) / 4] & 1) ||
+-	    (fScanGcc[(SAPPHIRE_GCC_DISP_AHB & 0xfff) / 4] & SAPPHIRE_CBCR_OFF) ||
+-	    !(fScanDispcc[SAPPHIRE_DISP_GDSCR / 4] & (1u << 31)) ||
+-	    !(fScanDispcc[SAPPHIRE_DISP_AHB / 4] & 1) ||
+-	    (fScanDispcc[SAPPHIRE_DISP_AHB / 4] & SAPPHIRE_CBCR_OFF)) {
+-		if (fScanEnabled) IOLog("SWEET FB: scan clocks or display power went off; using timer\n");
+-		fScanEnabled = false;
+-		return false;
+-	}
++	if (fIntf1 == NULL) return false;
+ 	volatile uint32_t *r = fIntf1 + 0x800 / 4;
+-	uint32_t f, l;
+-	do {
+-		f = r[0x0ac / 4];
++	uint32_t f = r[0x0ac / 4];
++	uint32_t l = r[0x0b0 / 4] & 0xffff;
++	uint32_t after = r[0x0ac / 4];
++	if (after != f) {
++		f = after;
+ 		l = r[0x0b0 / 4] & 0xffff;
+-	} while (r[0x0ac / 4] != f);
++	}
+ 	if (fScanLines != 0 && l >= fScanLines) {
+ 		if (fScanEnabled) IOLog("SWEET FB: invalid INTF_1 line %u; using timer\n", l);
+ 		fScanEnabled = false;
+@@ -805,18 +805,6 @@ AppleCLCD::scanUnavailable(void)
+ bool
+ AppleCLCD::scanStart(void)
+ {
+-	fScanGcc = (volatile uint32_t *)ml_io_map(0x01417000, 0x1000);
+-	fScanDispcc = (volatile uint32_t *)ml_io_map(0x05f00000, 0x2000);
+-	if (fScanGcc == NULL || fScanDispcc == NULL) return scanUnavailable();
+-	volatile uint32_t *gcc = fScanGcc + (SAPPHIRE_GCC_DISP_AHB & 0xfff) / 4;
+-	*gcc |= 1;
+-	for (unsigned i = 0; i < 100 && (*gcc & SAPPHIRE_CBCR_OFF); i++) IODelay(100);
+-	if (!(*gcc & 1) || (*gcc & SAPPHIRE_CBCR_OFF) ||
+-	    !(fScanDispcc[SAPPHIRE_DISP_GDSCR / 4] & (1u << 31))) return scanUnavailable();
+-	volatile uint32_t *ahb = fScanDispcc + SAPPHIRE_DISP_AHB / 4;
+-	*ahb |= 1;
+-	for (unsigned i = 0; i < 100 && (*ahb & SAPPHIRE_CBCR_OFF); i++) IODelay(100);
+-	if (!(*ahb & 1) || (*ahb & SAPPHIRE_CBCR_OFF)) return scanUnavailable();
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+ 	if (fIntf1 == NULL) return scanUnavailable();
+ 	volatile uint32_t *r = fIntf1 + 0x800 / 4;
+@@ -848,6 +836,7 @@ AppleCLCD::scanStart(void)
+ 	if (PE_parse_boot_argn("sapphire_scan_div", &div, sizeof(div)) && (div == 1 || div == 2)) fScanDiv = div;
+ 	fScanRate = (uint32_t)(((uint64_t)fScanMilliHz << 16) / (1000 * fScanDiv));
+ 	fScanLastFrame = ~0u;
++	fScanSameReads = 0;
+ 	fScanEnabled = true;
+ 	IOLog("SWEET FB: sapphire_scan=1: %u lines (%u shown), panel %u.%03u Hz; iOS %u.%03u Hz, every %u scan(s)\n",
+ 	    fScanLines, fScanShown, fScanMilliHz / 1000, fScanMilliHz % 1000,
+@@ -874,31 +863,8 @@ uint32_t
+ AppleCLCD::scanTimerUS(void)
+ {
+ 	if (fScanEnabled) return scanNextUS();
+-	/* If the display clocks go away, keep the published cadence on a free
+-	 * timer. The original 60 Hz interval remains the startup fallback. */
+-	return fScanRequested && fScanRate != 0 ?
+-	    (uint32_t)(fScanFrameNS * fScanDiv / 1000) : SWEET_FB_VSYNC_US;
+-}
+-
+-/* For a direct VIG0 flip the CTL flush latches at the next scan boundary.
+- * Submit it during the last ~1 ms, with at least 0.4 ms for the register
+- * writes. This keeps the old surface held only until that next latch. */
+-void
+-AppleCLCD::scanWaitLatch(void)
+-{
+-	uint64_t began = mach_absolute_time(), elapsed;
+-	for (;;) {
+-		uint32_t frame, line;
+-		if (!fScanEnabled || !scanRead(&frame, &line)) return;
+-		uint32_t first = fScanLines - 360, last = fScanLines - 120;
+-		if (line >= first && line < last) return;
+-		uint32_t ahead = line < first ? first - line : fScanLines - line + first;
+-		absolutetime_to_nanoseconds(mach_absolute_time() - began, &elapsed);
+-		if (elapsed > fScanFrameNS * 2) return;
+-		uint64_t aheadUS = (uint64_t)ahead * fScanLineNS / 1000;
+-		if (aheadUS > 2500) IOSleep((unsigned)((aheadUS - 1200) / 1000));
+-		else IODelay((unsigned)(aheadUS > 250 ? aheadUS - 200 : 25));
+-	}
++	/* The original timer interval is the fallback for an unavailable scan. */
++	return SWEET_FB_VSYNC_US;
+ }
+ 
+ /*
+@@ -1714,7 +1680,6 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				 */
+ 				if (s->gpuPool) {
+ 					/* GPU pool memory (write-combined): the MDP scans the surface itself, no copy */
+-					if (fScanEnabled) scanWaitLatch();
+ 					scanFrom(pa, s->bytesPerRow);
+ 				} else if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+@@ -1869,7 +1834,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 		s->release();
+ 	}
+ 	if (fFlip[0] != NULL) {
+-		if (fScanEnabled) scanWaitLatch();
+ 		flipBack();
+ 	}
+ }
+-- 
+2.56.0
+
