@@ -425,3 +425,20 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-10-24 18:47 +03: sapphire headphone tone patch 1034
+
+Prepared `1034-sapphire-wired-headphone-tone.patch` and `tools/ascripts/hph-tone.as`.
+`sapphire_hph=1` selects a tone-only RXTX RX_0/AIF1 RX0/RX1 -> INT0/INT1 ->
+WCD DP1 stereo HPH route, bypasses speaker codec/FS1815 setup and subsequent
+speaker stream opening. With the argument absent, existing behavior remains.
+Uses Linux WCD937x DAC/PGA events and v3 class-H CLS_AB sequencing with delays,
+PA widget bits 7/6 as well as bias bits 5/4, and shutdown/error unwind.
+Test script uses 1 kHz/5 s/1638 peak, RX -18 dB, analog gain code 12.
+Full fresh base-0139 apply check passed all 97 patches, source matched generation
+copy, diff checks and shell syntax passed. Local syntax check blocked by missing
+exported headers/meta_features.h. No kernel build or device operation performed.
+HPH SWR timing is derived from saved Android speaker captures plus upstream DP1
+stereo mapping; there is no captured headphone-playing dump. Audibility remains
+unverified. No combined speaker+HPH mode because shared RX0/supplies conflict.
+See `/home/fryad/ios-build/PROGRESS.md` for exact future test command and push hash.

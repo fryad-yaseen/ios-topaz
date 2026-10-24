@@ -1,0 +1,323 @@
+From 4dd992b4e2920383a99fbed183f2ca7d0eb5ac9f Mon Sep 17 00:00:00 2001
+From: Sapphire local <noreply@local.invalid>
+Date: Sat, 24 Oct 2026 18:46:19 +0300
+Subject: [PATCH] sapphire: add isolated RX_0 stereo wired headphone tone route
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 221 +++++++++++++++++++++++++++++---
+ 1 file changed, 204 insertions(+), 17 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index a15e406..875cb5e 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1428,6 +1428,15 @@ static const uint16_t rx_stock[][2] = {
+ static int vol_db = -30;
+ static bool codec_up, ports_up, amp_init, sapphire_route_failed;
+ 
++/* A tone-only route override. No cached state or log when absent. */
++static bool
++sapphire_hph_enabled(void)
++{
++	int arg = 0;
++	(void)PE_parse_boot_argn("sapphire_hph", &arg, sizeof(arg));
++	return arg == 1;
++}
++
+ /* Opt-in register comparison with Lunaris 007's active speaker route. */
+ static bool
+ sapphire_spk_ref_enabled(void)
+@@ -1812,7 +1821,7 @@ codec_bringup(void)
+ 	LOG("t=%u.%03u RPM L14 on: %s", T, ok ? "OK" : "FAILED");
+ 	lpass = (volatile uint8_t *)ml_io_map(LPASS_PA, LPASS_SIZE);
+ 	gpio92 = (volatile uint8_t *)ml_io_map(TLMM_GPIO92_PA, 0x1000);
+-	bool swr_locked = sapphire_spk_ref_enabled() || sapphire_swr_ref_enabled();
++	bool swr_locked = sapphire_hph_enabled() || sapphire_spk_ref_enabled() || sapphire_swr_ref_enabled();
+ 	if (swr_locked) sapphire_swr_lock = IOLockAlloc();
+ 	if (lpass == NULL || gpio92 == NULL || (swr_locked && sapphire_swr_lock == NULL)) {
+ 		LOG("LPASS map or SoundWire lock allocation failed");
+@@ -1872,13 +1881,15 @@ codec_bringup(void)
+ 	swr_wr(VA_SWR, 1, 0x3001, 0xC0); IOSleep(10); swr_wr(VA_SWR, 1, 0x3001, 0x80);
+ 	swr_wr(VA_SWR, 1, 0x30E2, 0xD9);
+ 	swr_wr(VA_SWR, 1, 0x30A5, 0xEB);
+-	swr_wr(VA_SWR, 1, 0x3409, 0x08); swr_wr(VA_SWR, 1, 0x3408, 0x01); swr_wr(VA_SWR, 1, 0x3008, 0x01);
+-	swr_wr(VA_SWR, 1, 0x340D, 0xBC); swr_wr(VA_SWR, 1, 0x340E, 0xBC); swr_wr(VA_SWR, 1, 0x340F, 0xBC);
+-	swr_wr(VA_SWR, 1, 0x3408, 0x03);
+-	swr_wr(VA_SWR, 1, 0x3408, 0x07); swr_wr(VA_SWR, 1, 0x3409, 0x0C); swr_wr(VA_SWR, 1, 0x344F, 0x01);
+-	swr_wr(VA_SWR, 1, 0x3009, 0x0C); swr_wr(VA_SWR, 1, 0x300A, 0x40); swr_wr(VA_SWR, 1, 0x300B, 0x12);
+-	swr_wr(VA_SWR, 1, 0x3008, 0x41); swr_wr(VA_SWR, 1, 0x3008, 0xC1);
+-	lw(RX_MACRO + 0x514, (uint32_t)vol_db & 0xFF);      /* RX_RX2_RX_VOL_CTL, s8 dB */
++	if (!sapphire_hph_enabled()) {
++		swr_wr(VA_SWR, 1, 0x3409, 0x08); swr_wr(VA_SWR, 1, 0x3408, 0x01); swr_wr(VA_SWR, 1, 0x3008, 0x01);
++		swr_wr(VA_SWR, 1, 0x340D, 0xBC); swr_wr(VA_SWR, 1, 0x340E, 0xBC); swr_wr(VA_SWR, 1, 0x340F, 0xBC);
++		swr_wr(VA_SWR, 1, 0x3408, 0x03);
++		swr_wr(VA_SWR, 1, 0x3408, 0x07); swr_wr(VA_SWR, 1, 0x3409, 0x0C); swr_wr(VA_SWR, 1, 0x344F, 0x01);
++		swr_wr(VA_SWR, 1, 0x3009, 0x0C); swr_wr(VA_SWR, 1, 0x300A, 0x40); swr_wr(VA_SWR, 1, 0x300B, 0x12);
++		swr_wr(VA_SWR, 1, 0x3008, 0x41); swr_wr(VA_SWR, 1, 0x3008, 0xC1);
++		lw(RX_MACRO + 0x514, (uint32_t)vol_db & 0xFF);      /* RX_RX2_RX_VOL_CTL, s8 dB */
++	}
+ 	codec_up = true;
+ 	LOG("t=%u.%03u codec ready", T);
+ 	return true;
+@@ -2040,6 +2051,169 @@ ports_and_pa(void)
+ 	LOG("t=%u.%03u ports: rx frame b1 %08x, irq %08x", T, lr(RX_SWR + 0x105C), lr(RX_SWR + 0x200));
+ }
+ 
++/* Android headphones: RXTX RX_0, AIF1 RX0/RX1 -> INT0/1 -> DP1 L/R.
++ * Sources: mixer_paths_bengal_idp.xml headphones + global CLS_AB/COMP=0;
++ * Linux lpass-rx-macro.c, wcd937x.c, wcd937x-sdw.c and wcd-clsh-v2.c.
++ * Captured Android SWR timing is reused, NOT claimed as an HPH capture.
++ * CLS_AB still uses the WCD937x v3 flyback/buck state machine. */
++static bool sapphire_hph_up;
++
++static bool
++sapphire_hph_ports(bool on)
++{
++	swr_wr(RX_SWR, 1, 0x041, 4);
++	swr_wr(RX_SWR, 1, 0x045, 8);
++	unsigned next = (lr(RX_SWR + 0x104c) & 1u) ^ 1u;
++	lw(RX_SWR + 0x112c, 1); /* 16-bit block length; captured speaker timing */
++	for (unsigned bank = 0; bank < 2; bank++) {
++		unsigned b = bank ? next ^ 1u : next;
++		/* DP1 carries HPH_L/R bits 0/1, lane 1, sample interval 3.
++		 * Disable all other ports, including inherited AUX/CLSH/COMP. */
++		for (unsigned port = 1; port <= 4; port++) {
++			uint32_t base = 0x1000 + port * 0x100 + b * 0x40;
++			lw(RX_SWR + base + 0x24, on && port == 1 ? 0x03000003u : 0);
++			lw(RX_SWR + base + 0x28, port == 1 ? 1 : 0);
++			for (unsigned r = 0x30; r <= 0x3c; r += 4) lw(RX_SWR + base + r, 0);
++			for (unsigned r = 0x20; r <= 0x28; r++) {
++				uint8_t v = 0;
++				if (port == 1) {
++					if (r == 0x20) v = on ? 3 : 0;
++					if (r == 0x22) v = 3;
++					if (r == 0x28) v = 1;
++				}
++				swr_wr(RX_SWR, 1, port * 0x100 + b * 0x10 + r, v);
++			}
++			swr_wr(RX_SWR, 1, port * 0x100 + 3, port == 1 ? 1 : 0);
++		}
++		lw(RX_SWR + 0x101c + b * 0x40, b ? 0x5000f : 0x2f0008);
++		if (bank == 0 && !sapphire_swr_android_switch(b)) return false;
++	}
++	return true;
++}
++
++static void
++sapphire_hph_off(void)
++{
++	if (!sapphire_hph_up) return;
++	for (unsigned n = 0; n < 2; n++)
++		sapphire_rx_bits(0x400 + n * 0x80, 0x10, 0x10, "HPH mute");
++	IOSleep(20);
++	/* DAPM PGA bits off, POST_PMD delay, watchdog off, then PA bias. */
++	sapphire_wcd_bits(0x3009, 0xc0, 0, "HPH PGA off");
++	IOSleep(20);
++	sapphire_wcd_bits(0x3465, 7, 0, "HPHL WD off");
++	sapphire_wcd_bits(0x3466, 7, 0, "HPHR WD off");
++	sapphire_wcd_bits(0x3009, 0x30, 0, "HPH PA bias off");
++	/* Last v3 class-H user: normal mode, flyback off, buck off. */
++	sapphire_wcd_bits(0x3009, 0x0c, 0, "HPH normal mode");
++	sapphire_wcd_bits(0x3008, 0x40, 0, "HPH flyback off");
++	IODelay(100);
++	sapphire_wcd_bits(0x30af, 0xe0, 0xe0, "HPH VNEG DAC");
++	IODelay(500);
++	sapphire_wcd_bits(0x3008, 0x80, 0, "HPH buck off");
++	IODelay(500);
++	sapphire_wcd_bits(0x3098, 0xff, 0x3a, "HPH buck settle");
++	IODelay(500);
++	sapphire_wcd_bits(0x3138, 0x20, 0, "HPH IQ reset");
++	sapphire_wcd_bits(0x30bf, 0xf0, 0x80, "HPH bias reset");
++	sapphire_wcd_bits(0x30d1, 0x0e, 6, "HPH PA reset");
++	sapphire_wcd_bits(0x30a8, 0xf0, 0x70, "HPH flyback default");
++	sapphire_wcd_bits(0x3008, 0x0c, 0, "HPH supply default");
++	for (unsigned n = 0; n < 2; n++) {
++		sapphire_wcd_bits(0x3133 + n * 3, 0x0f, 1, "HPH RDAC HD2 off");
++		sapphire_rx_bits(0x400 + n * 0x80, 0x30, 0x10, "HPH RX clock off");
++		sapphire_rx_bits(0x440 + n * 0x80, 1, 0, "HPH DSM off");
++		sapphire_rx_bits(0x404 + n * 0x80, 0x40, 0, "HPH CLSH off");
++	}
++	sapphire_wcd_bits(0x30d2, 0x50, 0x50, "HPH pull down");
++	sapphire_wcd_bits(0x3409, 3, 0, "HPH DAC clocks off");
++	sapphire_wcd_bits(0x3008, 1, 0, "HPH RX bias off");
++	sapphire_wcd_bits(0x3408, 3, 0, "HPH RX clocks off");
++	if (!sapphire_hph_ports(false)) LOG("HPH transport stop failed");
++	sapphire_rx_bits(0x200, 1, 0, "HPH CLSH clock off");
++	sapphire_hph_up = false;
++	LOG("HPH stopped");
++}
++
++static bool
++sapphire_hph_on(void)
++{
++	bool ok = true;
++	sapphire_hph_up = true; /* partial failures must unwind */
++	/* AIF muxes are software bookkeeping. INP0 enum RX0=5, RX1=6. */
++	sapphire_rx_bits(0x180, 0xff, 5, "HPH INT0 INP0 RX0");
++	sapphire_rx_bits(0x188, 0xff, 6, "HPH INT1 INP0 RX1");
++	sapphire_rx_bits(0x190, 0xff, 0, "HPH AUX disconnect");
++	sapphire_rx_bits(0x200, 1, 1, "HPH class-H clock");
++	sapphire_rx_bits(0x204, 7, 0, "HPH class-H decay");
++	sapphire_rx_bits(0x20c, 0x3f, 0x1c, "HPH class-H voltage");
++	sapphire_rx_bits(0x21c, 0x0f, 0, "HPH K1 MSB");
++	sapphire_rx_bits(0x220, 0xff, 0xc0, "HPH K1 LSB");
++	for (unsigned n = 0; n < 2; n++) {
++		uint32_t o = n * 0x80;
++		sapphire_rx_bits(0x400 + o, 0x7f, 0x34, "HPH RX 48k muted");
++		sapphire_rx_bits(0x404 + o, 0x48, 0x48, "HPH CLSH lookahead");
++		sapphire_rx_bits(0x408 + o, 3, 1, "HPH DEM, not EAR");
++		sapphire_rx_bits(0x40c + o, 3, 3, "HPH HPF");
++		sapphire_rx_bits(0x414 + o, 0xff, (uint8_t)-18, "HPH -18dB");
++		sapphire_rx_bits(0x418 + o, 0x30, 0, "HPH mix unmute");
++		sapphire_rx_bits(0x440 + o, 1, 1, "HPH DSM clock");
++	}
++	if (!sapphire_hph_ports(true)) { sapphire_hph_off(); return false; }
++	/* wcd937x_rx_clk_enable, then RDAC PRE_PMU. */
++	ok &= sapphire_wcd_bits(0x3409, 8, 8, "HPH digital MCLK");
++	ok &= sapphire_wcd_bits(0x3408, 1, 1, "HPH analog MCLK");
++	ok &= sapphire_wcd_bits(0x3008, 1, 1, "HPH RX bias");
++	for (unsigned n = 0; n < 3; n++)
++		ok &= sapphire_wcd_bits(0x340d + n, 0x40, 0, "HPH RX reset release");
++	ok &= sapphire_wcd_bits(0x3408, 2, 2, "HPH RX clock");
++	ok &= sapphire_wcd_bits(0x3409, 3, 3, "HPH L/R DAC clocks");
++	ok &= sapphire_wcd_bits(0x344e, 0x0c, 0x0c, "HPH gain source");
++	ok &= sapphire_wcd_bits(0x30d9, 0x80, 0, "HPH RDAC clock");
++	ok &= sapphire_wcd_bits(0x3414, 3, 0, "HPH companders off");
++	/* ALSA volume is inverted. Avoid code 20, the minimum/mute end;
++	 * use attenuated code 12 rather than XML value 20 (register zero). */
++	ok &= sapphire_wcd_bits(0x30d3, 0x3f, 0x2c, "HPHL low gain no comp");
++	ok &= sapphire_wcd_bits(0x30d6, 0x3f, 0x2c, "HPHR low gain no comp");
++	ok &= sapphire_wcd_bits(0x313a, 2, 0, "HPH timer PRE_PMU");
++	/* wcd_clsh_v3_state_hph_l/r(CLS_AB), shared supplies once. */
++	ok &= sapphire_wcd_bits(0x3008, 6, 0, "HPH v3 regulator/default");
++	ok &= sapphire_wcd_bits(0x30a8, 0xf0, 0x70, "HPH flyback mode");
++	ok &= sapphire_wcd_bits(0x30af, 0xe0, 0xa0, "HPH force IQ");
++	IODelay(100);
++	ok &= sapphire_wcd_bits(0x3099, 2, 2, "HPH class-H mode3");
++	ok &= sapphire_wcd_bits(0x3098, 0xff, 0x1c, "HPH class-H mode2");
++	ok &= sapphire_wcd_bits(0x30a5, 0xe0, 0xe0, "HPH flyback control");
++	ok &= sapphire_wcd_bits(0x3008, 0x40, 0x40, "HPH flyback enable");
++	IODelay(100);
++	ok &= sapphire_wcd_bits(0x30af, 0xe0, 0xe0, "HPH VNEG DAC");
++	IODelay(500);
++	ok &= sapphire_wcd_bits(0x30c7, 0xff, 0xaa, "HPH flyback current");
++	IODelay(100);
++	ok &= sapphire_wcd_bits(0x3008, 8, 0, "HPH buck default");
++	ok &= sapphire_wcd_bits(0x3008, 0x80, 0x80, "HPH buck enable");
++	IODelay(500);
++	ok &= sapphire_wcd_bits(0x3098, 0xff, 0x3a, "HPH buck settle");
++	IODelay(500);
++	ok &= sapphire_wcd_bits(0x3009, 0x0c, 0x0c, "HPH CLS_AB");
++	ok &= sapphire_wcd_bits(0x3009, 0x30, 0x30, "HPH PA PRE_PMU");
++	IODelay(100);
++	ok &= sapphire_wcd_bits(0x3465, 7, 3, "HPHL watchdog");
++	ok &= sapphire_wcd_bits(0x3466, 7, 3, "HPHR watchdog");
++	if (!ok) { sapphire_hph_off(); return false; }
++	/* DAPM PGA register write between PRE_PMU and POST_PMU. */
++	ok &= sapphire_wcd_bits(0x30d2, 0x50, 0, "HPH release pull down");
++	ok &= sapphire_wcd_bits(0x3009, 0xc0, 0xc0, "HPHL/R PGA enable");
++	IOSleep(20); /* no companders: Linux requires 20000..20100 us */
++	ok &= sapphire_wcd_bits(0x313a, 2, 2, "HPH timer POST_PMU");
++	ok &= sapphire_wcd_bits(0x3008, 2, 2, "HPH CLS_AB post PA");
++	if (!ok) { sapphire_hph_off(); return false; }
++	for (unsigned n = 0; n < 2; n++)
++		sapphire_rx_bits(0x400 + n * 0x80, 0x10, 0, "HPH unmute");
++	LOG("HPH ready RX_0 AIF1 DP1 stereo CLS_AB -18dB, analog gain code 12");
++	return true;
++}
++
+ /* ---------------------------------------------------------------- sapphire speaker amplifiers (sapphire_amp=1) */
+ /*
+  * Sapphire DT fragment@32 puts FS1815 0x34/0x35 or AW87559 0x58/0x5b on
+@@ -2859,6 +3033,7 @@ graph_open(uint64_t ring_pa, uint32_t ring_bytes, uint64_t pos_pa)
+ 	};
+ 	if (!as_graph_prepared) {
+ 		as_graph_prepared = true;
++		if (sapphire_hph_enabled()) { as_graph_intf = 1; as_graph_port = 1; as_graph_dma_index = 3; }
+ 		for (unsigned i = 0; i < as_count; i++)
+ 			if (as_lines[i].section == 2 && !strncmp(as_lines[i].text, "graph.", 6)) as_exec(2, as_lines[i]);
+ 	}
+@@ -3058,9 +3233,9 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 		LOG("tone: graph failed");
+ 		return;
+ 	}
+-	if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) {
++	if (!sapphire_hph_enabled() && sapphire_spk_dma_enabled() && sapphire_spk_enabled()) {
+ 		/* The RXTX DMA must see a clocked RX macro and enabled sink at START. */
+-		if (!ports_up) {
++		if (!sapphire_hph_enabled() && !ports_up) {
+ 			ports_and_pa();
+ 			ports_up = true;
+ 		}
+@@ -3070,25 +3245,33 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 			return;
+ 		}
+ 	}
++	if (sapphire_hph_enabled() && !sapphire_hph_on()) {
++		(void)sg_cmd(APM_GRAPH_CLOSE);
++		LOG("tone: HPH setup failed");
++		return;
++	}
+ 	if (!sg_cmd(APM_GRAPH_START)) {
+-		if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) sapphire_codec_off();
++		if (sapphire_hph_enabled()) sapphire_hph_off();
++		if (!sapphire_hph_enabled() && sapphire_spk_dma_enabled() && sapphire_spk_enabled()) sapphire_codec_off();
+ 		(void)sg_cmd(APM_GRAPH_CLOSE);
+ 		LOG("tone: graph start failed");
+ 		return;
+ 	}
+ 	for (unsigned i = 0; i < as_count; i++)
+ 		if (as_lines[i].section == 2 && strncmp(as_lines[i].text, "graph.", 6)) as_exec(2, as_lines[i]);
+-	if (!ports_up) {
++	if (!sapphire_hph_enabled() && !ports_up) {
+ 		ports_and_pa();
+ 		ports_up = true;
+ 	}
+-	if (sapphire_route_failed) {
++	if (!sapphire_hph_enabled() && sapphire_route_failed) {
+ 		(void)sg_cmd(APM_GRAPH_STOP);
+ 		(void)sg_cmd(APM_GRAPH_CLOSE);
+ 		LOG("tone: sapphire SoundWire setup failed");
+ 		return;
+ 	}
+-	if (sapphire_spk_enabled()) {
++	if (sapphire_hph_enabled()) {
++		/* Headphone route already powered before graph START. */
++	} else if (sapphire_spk_enabled()) {
+ 		sapphire_rx_bits(0x414, 0xff, sapphire_spk_ref_enabled() ? 0u : (uint32_t)vol_db & 0xff, "tone EAR volume");
+ 		sapphire_rx_bits(0x514, 0xff, sapphire_spk_ref_enabled() ? 0xfcu : (uint32_t)vol_db & 0xff, "tone AUX volume");
+ 		if (!sapphire_spk_dma_enabled() && !sapphire_codec_on()) {
+@@ -3109,7 +3292,9 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 		lw(RX_MACRO + 0x518, 0x04);
+ 		lw(RX_MACRO + 0x500, 0x24);                     /* topaz RX2 path on */
+ 	}
+-	if (sapphire_spk_ref_enabled())
++	if (sapphire_hph_enabled())
++		LOG("t=%u.%03u tone: HPH playing %u s at -18 dB", T, seconds);
++	else if (sapphire_spk_ref_enabled())
+ 		LOG("t=%u.%03u tone: playing %u s, EAR 0 dB AUX -4 dB", T, seconds);
+ 	else
+ 		LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
+@@ -3143,7 +3328,9 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 	}
+ 	LOG("t=%u.%03u tone: DSP position frame %u index %u", T, pos[0], pos[1]);
+ 	if (test_mode) LOG("spktest done mode=%u frames=%u (audibility is the output check)", test_mode, pos[0]);
+-	if (sapphire_spk_enabled()) {
++	if (sapphire_hph_enabled()) {
++		sapphire_hph_off();
++	} else if (sapphire_spk_enabled()) {
+ 		sapphire_rx_bits(0x414, 0xff, (uint32_t)-84 & 0xff, "tone EAR mute");
+ 		sapphire_rx_bits(0x514, 0xff, (uint32_t)-84 & 0xff, "tone AUX mute");
+ 		IOSleep(30);
+@@ -3525,7 +3712,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 				} else if (as_tone_secs || (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0)) {
+ 					tone_test(MIN(tone, 10u), 0);
+ 				}
+-				if (stream_open()) {
++				if (!sapphire_hph_enabled() && stream_open()) {
+ 					audio_dev_init();
+ 				}
+ 			}
+-- 
+2.56.0
+
