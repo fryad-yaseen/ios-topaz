@@ -1,0 +1,117 @@
+From ac6dd75fe2203e1e1e16762a75b7aae2e3cf8c90 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 10:27:16 +0300
+Subject: [PATCH] sapphire: add bounded channel PCM speaker test
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 61 ++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 5adee19..0926bd8 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2693,9 +2693,42 @@ sapphire_spk_probe_sample(unsigned n, volatile uint32_t *pos)
+ 	    e0, e1, e2, e3);
+ }
+ 
++/* Opt-in two-second PCM path test. 1=EAR/left, 2=AUX/right, 3=alternate.
++ * Each 250 ms tone burst is followed by 250 ms of digital zero. This tests
++ * real samples across the existing AudioReach DMA/SWR/PA route; an audible
++ * burst proves that entire channel. Status registers do not measure PCM.
++ */
++static unsigned
++sapphire_spk_test_mode(void)
++{
++	static int mode = -1;
++	if (mode < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_spk_test", &arg, sizeof(arg));
++		mode = arg >= 1 && arg <= 3 ? arg : 0;
++		if (arg && !mode) LOG("spktest invalid mode=%d; disabled", arg);
++	}
++	return (unsigned)mode;
++}
++
++static void
++sapphire_spk_test_status(unsigned phase, unsigned mode, volatile uint32_t *pos)
++{
++	uint32_t frame = (pos[1] / 4) % 48000;
++	char stimulus = (frame / 12000) % 2 ? '-' :
++	    mode == 1 ? 'L' : mode == 2 ? 'R' : frame < 24000 ? 'L' : 'R';
++	uint16_t a[4] = { 0xffff, 0xffff, 0xffff, 0xffff };
++	int e0 = sapphire_fs_read(0x34, 0x03, &a[0]);
++	int e1 = sapphire_fs_read(0x34, 0x04, &a[1]);
++	int e2 = sapphire_fs_read(0x35, 0x03, &a[2]);
++	int e3 = sapphire_fs_read(0x35, 0x04, &a[3]);
++	LOG("spktest phase=%u stim=%c pos=%u/%u fs34=%04x/%04x fs35=%04x/%04x err=%d,%d,%d,%d",
++	    phase, stimulus, pos[0], pos[1], a[0], a[1], a[2], a[3], e0, e1, e2, e3);
++}
++
+ /* boot-arg adsp_tone=N: N seconds of 1 kHz from the speaker, once the codec is up */
+ static void
+-tone_test(unsigned seconds)
++tone_test(unsigned seconds, unsigned test_mode)
+ {
+ 	const uint32_t frames = 48000, bytes = frames * 4;  /* 1 s, a whole number of 1 kHz periods */
+ 	uint64_t ring_pa = 0, pos_pa = 0;
+@@ -2712,10 +2745,16 @@ tone_test(unsigned seconds)
+ 		uint32_t k = f % 48, a = k % 24;
+ 		int16_t v = a <= 12 ? q[a] : q[24 - a];
+ 		v = k < 24 ? v : (int16_t)-v;
+-		ring[2 * f] = v;
+-		ring[2 * f + 1] = v;
++		if (test_mode && (f / 12000) % 2) v = 0; /* 250 ms on/off */
++		bool left = test_mode != 2 && (test_mode != 3 || (f / 24000) == 0);
++		bool right = test_mode != 1 && (test_mode != 3 || (f / 24000) == 1);
++		ring[2 * f] = left ? v : 0;
++		ring[2 * f + 1] = right ? v : 0;
+ 	}
+ 	mb();
++	if (test_mode)
++		LOG("spktest mode=%u duration=%us 1kHz peak=%d/32767 burst=250ms left=%d right=%d",
++		    test_mode, seconds, q[12], test_mode != 2, test_mode != 1);
+ 	if (!graph_open(ring_pa, bytes, pos_pa)) {
+ 		LOG("tone: graph failed");
+ 		return;
+@@ -2772,7 +2811,15 @@ tone_test(unsigned seconds)
+ 		LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
+ 	unsigned probe_start = ms(), probe_next = probe_start, probe_n = 0;
+ 	bool probe = sapphire_spk_probe_enabled();
++	unsigned test_phase = ~0u;
+ 	for (unsigned t = probe_start; ms() - t < seconds * 1000;) {
++		if (test_mode) {
++			unsigned phase = (ms() - probe_start) / 250;
++			if (phase != test_phase) {
++				test_phase = phase;
++				sapphire_spk_test_status(phase, test_mode, pos);
++			}
++		}
+ 		if (probe && probe_n < seconds * 20 && ms() >= probe_next) {
+ 			sapphire_spk_probe_sample(probe_n++, pos);
+ 			probe_next += 50;
+@@ -2783,6 +2830,7 @@ tone_test(unsigned seconds)
+ 		}
+ 	}
+ 	LOG("t=%u.%03u tone: DSP position frame %u index %u", T, pos[0], pos[1]);
++	if (test_mode) LOG("spktest done mode=%u frames=%u (audibility is the output check)", test_mode, pos[0]);
+ 	if (sapphire_spk_enabled()) {
+ 		sapphire_rx_bits(0x414, 0xff, (uint32_t)-84 & 0xff, "tone EAR mute");
+ 		sapphire_rx_bits(0x514, 0xff, (uint32_t)-84 & 0xff, "tone AUX mute");
+@@ -3153,8 +3201,11 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			codec_tried = true;
+ 			(void)PE_parse_boot_argn("adsp_vol", &vol_db, sizeof(vol_db));
+ 			if (codec_bringup()) {
+-				if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
+-					tone_test(MIN(tone, 10u));
++				unsigned test_mode = sapphire_spk_test_mode();
++				if (test_mode) {
++					tone_test(2, test_mode);
++				} else if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
++					tone_test(MIN(tone, 10u), 0);
+ 				}
+ 				if (stream_open()) {
+ 					audio_dev_init();
+-- 
+2.56.0
+
