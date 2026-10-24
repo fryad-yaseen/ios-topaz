@@ -472,3 +472,17 @@ DP4 slave remains the leading untested transport lead, with Android capture
 ambiguity. Static limits/read bounds/alignment passed; boot args552 chars.
 No phone interaction, kernel build, image generation, flash or push.
 Existing untracked fs-input-amp-rearm.as/spk-loud.as were left untouched.
+
+## 2026-10-24: patch 1035 eGPIO ownership
+
+Compared Angelpro09xd 0198/0199, commits 97008c1f2f3f and c5b63b18e2a8.
+Our TopazAudio already has EAR INT0/RDAC3/DP1 alongside AUX INT2/DP4
+from 1006/1015, and Xiaomi AUX HP_MODE from 1008. No extra EAR switch needed.
+1035 updates sapphire_reset, retaining the existing GPIO mux/output fields
+and all other CTL bits, setting ownership bit 12 only if present bit 11 is set.
+Default on in every sapphire amp reset; sapphire_egpio=0 clears ownership
+when present, for comparison. Logs both GPIOs CTL before/after each edge.
+The 0146 stream path calls sapphire_codec_on and amp_on through 1006;
+normal sapphire_spk/sapphire_amp daily audio therefore uses the fix too.
+Full clean base-0139 apply check passed 98 patches and git diff --check.
+No phone operation. Codemagic build/artifact validation pending.

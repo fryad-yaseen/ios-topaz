@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2274,8 +2274,21 @@
+ 	volatile uint8_t *base = sapphire_gpio[side];
+ 	*(volatile uint32_t *)(base + 4) = high ? 2u : 0u;
+ 	mb();
+-	*(volatile uint32_t *)base = 0x200u; /* GPIO function, output, 2 mA */
++	uint32_t before = *(volatile uint32_t *)base;
++	int egpio = 1;
++	(void)PE_parse_boot_argn("sapphire_egpio", &egpio, sizeof(egpio));
++	/* Keep the existing GPIO mux/output setup, preserving all other fields.
++	 * SM6115 eGPIO ownership is meaningful only when EGPIO_PRESENT is set. */
++	uint32_t ctl = (before & ~0x3ffu) | 0x200u;
++	if (before & (1u << 11)) {
++		if (egpio) ctl |= 1u << 12;
++		else ctl &= ~(1u << 12);
++	}
++	*(volatile uint32_t *)base = ctl;
+ 	mb();
++	LOG("amp eGPIO GPIO%u high=%u enabled=%d CTL %08x -> %08x",
++	    side ? 99u : 105u, high ? 1u : 0u, egpio != 0,
++	    before, *(volatile uint32_t *)base);
+ }
+ 
+ static int
