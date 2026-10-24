@@ -1,0 +1,144 @@
+From 4c4410df0c6b425812fa6f8faa2eb7e3d2f856fe Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 09:46:31 +0300
+Subject: [PATCH] sapphire: bound ADSP battery client when PMIC channel stays
+ closed
+
+---
+ iokit/Kernel/arm/SapphireBattmgr.inc | 21 ++++++++++++++++++---
+ iokit/Kernel/arm/TopazAudio.cpp      | 22 +++++++++++++++-------
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireBattmgr.inc b/iokit/Kernel/arm/SapphireBattmgr.inc
+index 7643e89..1b03cc3 100644
+--- a/iokit/Kernel/arm/SapphireBattmgr.inc
++++ b/iokit/Kernel/arm/SapphireBattmgr.inc
+@@ -27,8 +27,8 @@ static const struct { uint32_t opcode, property; } batt_asks[] = {
+ #define BATT_REQUIRED ((1u << 7) - 1u)
+ 
+ static struct {
+-	bool enabled, linked, notified, active, waiting, dirty, valid;
+-	unsigned index, deadline, next, seen, last_log, last_error_log;
++	bool enabled, linked, notified, active, waiting, dirty, valid, gave_up;
++	unsigned index, deadline, next, seen, last_log, last_error_log, open_deadline, failures;
+ 	uint64_t sampled_at;
+ 	struct sapphire_batt_sample work, latest;
+ 	IOLock *lock;
+@@ -85,6 +85,7 @@ static void
+ batt_poll(void)
+ {
+ 	if (!batt.enabled) return;
++	unsigned now = ms();
+ 	if (!glink_chan_up(BATT_CHAN)) {
+ 		if (batt.linked) {
+ 			IOLockLock(batt.lock);
+@@ -93,10 +94,19 @@ batt_poll(void)
+ 			batt.linked = false;
+ 		}
+ 		batt.notified = batt.active = batt.waiting = false;
++		if (!batt.gave_up && (int)(now - batt.open_deadline) >= 0) {
++			batt.gave_up = true;
++			IOLog("SWEET BATTERY: ADSP did not open PMIC_RTR within 15s; idle until remote OPEN\n");
++		}
+ 		return;
+ 	}
++	if (batt.gave_up && batt.linked) return;
++	if (batt.gave_up) {
++		IOLog("SWEET BATTERY: ADSP PMIC_RTR remote opened; resuming\n");
++		batt.gave_up = false;
++		batt.failures = 0;
++	}
+ 	batt.linked = true;
+-	unsigned now = ms();
+ 	if (!batt.notified) {
+ 		/* Android's BC_SET_NOTIFY_REQ: four zero words after the header. */
+ 		const uint32_t q[7] = { BATT_OWNER, BATT_NOTIFY, BATT_SET_NOTIFY, 0, 0, 0, 0 };
+@@ -122,6 +132,7 @@ batt_poll(void)
+ 		    s->present == 1 && s->voltage_uv >= 2800000 && s->voltage_uv <= 4600000 &&
+ 		    s->temperature >= -3000 && s->temperature <= 8000 && s->usb_online <= 1;
+ 		if (good) {
++			batt.failures = 0;
+ 			IOLockLock(batt.lock);
+ 			batt.latest = batt.work;
+ 			batt.sampled_at = mach_absolute_time();
+@@ -141,6 +152,10 @@ batt_poll(void)
+ 		}
+ 		batt.active = false;
+ 		batt.next = now + 30000;
++		if (!good && ++batt.failures >= 3) {
++			batt.gave_up = true;
++			IOLog("SWEET BATTERY: ADSP requests failed three rounds; idle until remote OPEN\n");
++		}
+ 		return;
+ 	}
+ 	struct batt_wire q = { BATT_OWNER, BATT_GET, batt_asks[batt.index].opcode,
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 79afbe3..3bd02a2 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -386,6 +386,7 @@ static uint32_t g_rx_len, g_features = 1, g_next_intent = 1, g_chans;
+ static struct chan *g_ch;                       /* MAX_CHANS */
+ static uint32_t g_rx_msgs, g_tx_msgs;
+ static bool g_dead;
++static bool g_batt_tx;
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -436,7 +437,7 @@ tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
+ {
+ 	uint32_t head = 0, tail, avail, n;
+ 
+-	for (n = 0; n < 1000; n++) {
++	for (n = 0; n < (g_batt_tx ? 1u : 1000u); n++) {
+ 		head = g_desc[1];
+ 		tail = g_desc[0];
+ 		avail = tail <= head ? GLINK_TX_SIZE - head + tail : tail - head;
+@@ -444,10 +445,10 @@ tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
+ 		if (avail >= ((hlen + dlen + 7) & ~7u)) {
+ 			break;
+ 		}
+-		IODelay(100);
++		if (!g_batt_tx) IODelay(100);
+ 	}
+-	if (n == 1000) {
+-		LOG("glink TX FIFO full");
++	if (n == (g_batt_tx ? 1u : 1000u)) {
++		if (!g_batt_tx) LOG("glink TX FIFO full");
+ 		return false;
+ 	}
+ 	head = tx_put(head, hdr, hlen);
+@@ -588,14 +589,20 @@ try_send(struct chan *c, const void *data, uint32_t len)
+ 	struct glink_data_hdr h = { { CMD_TX_DATA, c->lcid, c->ri[i].id }, len, 0 };
+ 	c->ri[i].used = true;
+ 	c->tx_pkts++;
+-	return tx_write(&h, sizeof(h), data, len);
++	if (tx_write(&h, sizeof(h), data, len)) return true;
++	c->ri[i].used = false;
++	c->tx_pkts--;
++	return false;
+ }
+ 
+ static void
+ pump(struct chan *c)
+ {
+-	while (chan_up(c) && c->txq_head != c->txq_tail &&
+-	    try_send(c, c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN])) {
++	while (chan_up(c) && c->txq_head != c->txq_tail) {
++		g_batt_tx = strcmp(c->name, "PMIC_RTR_ADSP_APPS") == 0;
++		bool sent = try_send(c, c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN]);
++		g_batt_tx = false;
++		if (!sent) break;
+ 		IOFree(c->txq[c->txq_head % TXQ_LEN], c->txq_len[c->txq_head % TXQ_LEN]);
+ 		c->txq_head++;
+ 	}
+@@ -3022,6 +3029,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		IOLock *lock = IOLockAlloc();
+ 		batt.enabled = lock != NULL;
+ 		if (batt.enabled) {
++			batt.open_deadline = ms() + 15000;
+ 			__atomic_store_n(&batt.lock, lock, __ATOMIC_RELEASE);
+ 			glink_register(BATT_CHAN, batt_rx);
+ 			IOLog("SWEET BATTERY: ADSP PMIC GLINK client enabled\n");
+-- 
+2.56.0
+
