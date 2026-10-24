@@ -457,3 +457,18 @@ HP_MODE bit4 clear/WD5. No obvious missing EAR PA enable bit found.
 Static interpreter bounds/commands and diff checks passed. No phone command,
 build, flash, image generation or push. Hardware results remain pending.
 Full observed comparison TSV and saved-source notes are in ~/ios-build/research.
+
+## 2026-10-24: spk2 research after all earlier speaker tests failed
+
+Added three unrun build18 scripts in ranked order: spk2-dp4-enable.as,
+spk2-ear-only.as, spk2-music-replay.as. Full findings, interpretation and exact
+120s speaker-base commands are in tools/ascripts/spk2-tests-2026-10-24.md.
+Decoded firmware table audit is spk2-scene-audit-2026-10-24.md. No AF/C4 write
+or wait opcode in local tables; published FS1815 startup has no hidden unmute
+or ready poll. Handset selects EAR external amp Receiver, so EAR is not an
+independent bare-WCD control. Receiver mapping remains unknown; EAR-only
+script retains Music and stereo ring, explicitly a partial handset test.
+DP4 slave remains the leading untested transport lead, with Android capture
+ambiguity. Static limits/read bounds/alignment passed; boot args552 chars.
+No phone interaction, kernel build, image generation, flash or push.
+Existing untracked fs-input-amp-rearm.as/spk-loud.as were left untouched.

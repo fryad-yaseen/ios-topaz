@@ -1,0 +1,81 @@
+# Build18, no reset. Lower-confidence late scene reload, not just power rearm.
+# Whole-register equivalents assume Android Music baseline: 3f0110,
+# bc1423, 590821, 19=000b/000e. Inspect readbacks before interpretation.
+# Do not treat BC bit3 as an enable; leave it clear as in firmware baseline.
+@codec
+tone 1000 5 1638 LR
+@graph
+graph.intf 1
+graph.port 1
+graph.dma_index 3
+@tone
+rx 0x180 0x05
+rx 0x190 0x06
+# Shutdown BOTH amps, then replay Music separately and start 34 before35.
+i2c 34 0x10 0x0001
+i2c 34 0x11 0x0000
+i2c 35 0x10 0x0001
+i2c 35 0x11 0x0000
+delay 10
+log replay Music and startup amp 34
+i2c 34 0x20 0x1722
+i2c 34 0x22 0x0208
+i2c 34 0x23 0x0027
+i2c 34 0x18 0x000a
+i2c 34 0x3f 0x0110
+i2c 34 0xbc 0x1423
+i2c 34 0x1f 0xca91
+i2c 34 0x58 0x827a
+i2c 34 0x59 0x0821
+i2c 34 0x19 0x000b
+i2c 34 0x5a 0xfcab
+i2c 34 0x1f 0x0000
+i2c 34 0x11 0x008f
+i2c 34 0x10 0x0000
+delay 10
+rd i2c34 0x10 2
+rd i2c34 0x18 2
+rd i2c34 0x20 4
+rd i2c34 0x3e 2
+rd i2c34 0x58 4
+rd i2c34 0xbc 1
+log replay Music and startup amp 35
+i2c 35 0x20 0x1722
+i2c 35 0x22 0x0208
+i2c 35 0x23 0x0027
+i2c 35 0x18 0x000a
+i2c 35 0x3f 0x0110
+i2c 35 0xbc 0x1423
+i2c 35 0x1f 0xca91
+i2c 35 0x58 0x827a
+i2c 35 0x59 0x0821
+i2c 35 0x19 0x000e
+i2c 35 0x5a 0xfcab
+i2c 35 0x1f 0x0000
+i2c 35 0x11 0x008f
+i2c 35 0x10 0x0000
+delay 10
+rd i2c35 0x10 2
+rd i2c35 0x18 2
+rd i2c35 0x20 4
+rd i2c35 0x3e 2
+rd i2c35 0x58 4
+rd i2c35 0xbc 1
+every 500ms rd rx 0x180 5
+every 500ms rd rx 0x400 6
+every 500ms rd rx 0x500 6
+every 500ms rd swr 0x104c 1
+every 500ms rd swr 0x1424 3
+every 500ms rd swr 0x1464 3
+every 500ms rd swrs 0x420 8
+every 500ms rd swrs 0x430 8
+every 500ms rd wcd 0x3008 4
+every 500ms rd wcd 0x30ef 2
+every 500ms rd wcd 0x3128 1
+every 500ms rd wcd 0x3408 8
+every 500ms rd wcd 0x344e 3
+every 500ms rd wcd 0x3465 3
+every 500ms rd i2c34 0x00 5
+every 500ms rd i2c35 0x00 5
+@stop
+log spk2 Music replay done; kernel shuts down amps
