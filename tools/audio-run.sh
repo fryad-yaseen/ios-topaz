@@ -10,7 +10,7 @@ kernel=${AUDIO_KERNEL:-/home/fryad/ios-build/xnu-cm-24/out-4k/kernel.development
 out=${AUDIO_BOOT_IMAGE:-/tmp/sapphire-audio-run.img}
 log=${AUDIO_LOG:-/tmp/sapphire-audio-$(date +%Y%m%d-%H%M%S).txt}
 # mk-amp-boot already supplies sapphire_amp=1.
-base='gpu_vote=1 sapphire_spk=1 sapphire_spk_fix=1 sapphire_spk_xm=1 sapphire_spk_ref=1 sapphire_swr_ref=1 sapphire_ascript=1 sapphire_autoreboot=45'
+base=${AUDIO_BASE:-'gpu_vote=1 sapphire_spk=1 sapphire_spk_fix=1 sapphire_spk_xm=1 sapphire_spk_ref=1 sapphire_swr_ref=1 sapphire_ascript=1 sapphire_autoreboot=45'}
 export AUDIO_SCRIPT="$script" GPU_MHZ=785 EXTRA_ARGS="$base${*:+ $*}"
 "$repo/tools/mk-amp-boot.sh" "$kernel" "$out"
 echo "Waiting for fastboot..." >&2
