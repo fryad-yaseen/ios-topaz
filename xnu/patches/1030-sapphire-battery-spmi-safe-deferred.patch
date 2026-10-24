@@ -1,0 +1,171 @@
+From 202f0dd73f00cb0ea6051d354c9b33b363c30941 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 11:04:36 +0300
+Subject: [PATCH] sapphire: defer battery SPMI reads and use live v5 arbiter
+ map
+
+The live SM6225 DT maps core/observer/config at 01c40000/03e00000/01c0a000; the old addresses could stall MMIO during SweetBattery::start. Publish static state before service registration and run direct reads only on the timer. Require EE0 APID ownership and bound command status polling.
+---
+ bsd/dev/sweet_spmi.c              | 28 +++++++++++++---------------
+ iokit/Kernel/arm/SweetBattery.cpp | 26 ++++++++++++++++++--------
+ 2 files changed, 31 insertions(+), 23 deletions(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index bf1c366..23e114f 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -9,14 +9,16 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
++#include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
++/* live.dtb /soc/qcom,spmi@1c40000, reg-names core/obsrvr/cnfg. */
++#define SP_CORE_PA 0x01c40000u
++#define SP_OBS_PA  0x03e00000u
++#define SP_CFG_PA  0x01c0a000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -37,18 +39,18 @@ sp_rd(vm_offset_t base, unsigned off)
+ static uint16_t
+ sp_find_apid(unsigned ppid)
+ {
+-	uint16_t found = SP_NO_APID;
+ 	for (unsigned i = 0; i < sp_count; ++i) {
+ 		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+ 		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+ 		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
++		/* Only issue observer commands on lanes assigned to APPS (EE0). */
++		if (owner == 0) {
++			return (uint16_t)i;
+ 		}
+ 	}
+-	return found;
++	return SP_NO_APID;
+ }
+ 
+ int
+@@ -66,15 +68,12 @@ sweet_spmi_init(void)
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+ 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("SWEET BATTERY: SPMI mapping failed\n");
+ 		return -1;
+ 	}
+ 	uint32_t arb_version = sp_rd(sp_core, 0);
+ 	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
++	if (arb_version < 0x50000000u || arb_version >= 0x60000000u ||
+ 	    !sp_count || sp_count > 512) {
+-		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+@@ -107,7 +106,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+-			if (status & 0x0eu) {
++			if (status & 0x7eu) {
++				sp_poisoned[apid] = true;
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+@@ -115,11 +115,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+-		delay(1);
++		IODelay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0312717..7d3941c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -32,7 +32,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal, fSapphire, fSapphireDirect;
++	bool fTimerAdded, fRunning, fReal, fSapphire, fSapphireDirect, fDirectFailed;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -61,7 +61,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = fSapphire = fSapphireDirect = false;
++	fTimerAdded = fRunning = fReal = fSapphire = fSapphireDirect = fDirectFailed = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -417,8 +417,14 @@ void
+ SweetBattery::poll(void)
+ {
+ 	if (fSapphireDirect) {
+-		if (!pollSapphireDirect())
++		if (sweet_spmi_init() || !pollSapphireDirect()) {
++			if (!fDirectFailed)
++				IOLog("SWEET BATTERY: direct SPMI read failed; static fallback\n");
++			fDirectFailed = true;
+ 			publish(100, 4200, 0, false, false, false, false, false, false);
++		} else {
++			fDirectFailed = false;
++		}
+ 		return;
+ 	}
+ 	if (fSapphire) {
+@@ -506,21 +512,25 @@ SweetBattery::start(IOService *provider)
+ 	(void)PE_parse_boot_argn("sapphire_batt", &sapphire, sizeof(sapphire));
+ 	int direct = 0;
+ 	(void)PE_parse_boot_argn("sapphire_batt_direct", &direct, sizeof(direct));
+-	fSapphireDirect = direct == 1 && sweet_spmi_init() == 0;
++	fSapphireDirect = direct == 1;
+ 	fSapphire = !fSapphireDirect && sapphire == 1;
+ 	fReal = fSapphireDirect || fSapphire || (real == 1 && sweet_i2c1_init() == 0);
+-	/* Publish a complete source BEFORE registerService wakes powerd. */
+-	poll();
++	/* No SPMI mapping or reads on the start path. Publish fallback first. */
++	if (fSapphireDirect)
++		publish(100, 4200, 0, false, false, false, false, false, false);
++	else
++		poll();
+ 	if (fReal) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(fSapphireDirect ? 20000 : 10000);
++			fTimer->setTimeoutMS(fSapphireDirect ? 100 : 10000);
+ 		} else {
+ 			fReal = false;
+-			poll();
++			if (!fSapphireDirect)
++				poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
+ 	}
+-- 
+2.56.0
+
