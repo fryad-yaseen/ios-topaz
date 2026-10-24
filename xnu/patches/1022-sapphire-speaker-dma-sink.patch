@@ -1,0 +1,153 @@
+From 0ae53317184938470d99fcc945c17fc378101e51 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 09:48:09 +0300
+Subject: [PATCH] sapphire: prime RX DMA sink before starting speaker graph
+
+The graph currently starts while the RX macro interpolators and WCD path are still off. Gate a pre-start sink setup behind sapphire_spk_dma=1, restore Android RX0 CFG3, and log the DMA route and SoundWire FIFO state at playback start and 500 ms. Device playback remains to be validated.
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 69 +++++++++++++++++++++++++++++++--
+ 1 file changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 79afbe3..125e0ae 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1435,6 +1435,19 @@ sapphire_spk_ref_enabled(void)
+ }
+ 
+ /* Reproduce the RX SoundWire transport captured on sapphire Android. */
++static bool
++sapphire_spk_dma_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		(void)PE_parse_boot_argn("sapphire_spk_dma", &arg, sizeof(arg));
++		enabled = arg == 1;
++		LOG("sapphire_spk_dma=%d", enabled);
++	}
++	return enabled != 0;
++}
++
+ static bool
+ sapphire_swr_ref_enabled(void)
+ {
+@@ -1555,6 +1568,8 @@ sapphire_rx_route(void)
+ {
+ 	sapphire_rx_bits(0x180, 0xf0, 0x70, "INT0 INP1=RX2");
+ 	sapphire_rx_bits(0x190, 0x0f, 0x08, "INT2 INP0=RX3");
++	if (sapphire_spk_dma_enabled())
++		sapphire_rx_bits(0x410, 0xff, 0x03, "Android RX0 path CFG3");
+ 	sapphire_rx_bits(0x404, 0x48, 0x48, "INT0 CLSH + delay");
+ 	sapphire_rx_bits(0x408, 0x03, 0x03, "INT0 DEM + EAR");
+ 	sapphire_rx_bits(0x20c, 0x3f, 0x39, "EAR class-H voltage");
+@@ -1609,6 +1624,8 @@ sapphire_codec_ref_on(void)
+ 		if (sapphire_rx_ref[i].reg == 0x414 || sapphire_rx_ref[i].reg == 0x514) continue;
+ 		sapphire_rx_bits(sapphire_rx_ref[i].reg, 0xffffffffu, sapphire_rx_ref[i].on, sapphire_rx_ref[i].name);
+ 	}
++	if (sapphire_spk_dma_enabled())
++		sapphire_rx_bits(0x410, 0xff, 0x03, "Android RX0 path CFG3");
+ 	/* DAPM order: class-H, RX bias/supplies, clocks, RDACs, watchdog,
+ 	 * then EAR and AUX PAs. Hardware creates the three status values. */
+ 	ok &= sapphire_wcd_bits(0x30a8, 0xff, 0x7f, "class-H flyback mode");
+@@ -2178,6 +2195,20 @@ sapphire_swr_ref_dump(const char *when)
+ static void
+ sapphire_ref_dump(const char *when)
+ {
++	if (sapphire_spk_dma_enabled()) {
++		static const uint16_t rx[] = { 0x100, 0x104, 0x108, 0x180, 0x190,
++			0x400, 0x410, 0x500, 0x510, 0x784, 0xa04 };
++		for (unsigned i = 0; i < sizeof(rx) / sizeof(rx[0]); i++)
++			LOG("spk dma %s RX %03x=%02x", when, rx[i], lr(RX_MACRO + rx[i]) & 0xff);
++		LOG("spk dma %s SWR MCP=%08x frame0=%08x frame1=%08x bank=%08x IRQ=%08x FIFO=%08x FIFO mirrors=%08x/%08x/%08x DP1=%08x DP4=%08x",
++			when, lr(RX_SWR + 0x1048), lr(RX_SWR + 0x101c),
++			lr(RX_SWR + 0x105c), lr(RX_SWR + 0x104c),
++			lr(RX_SWR + 0x200), lr(RX_SWR + 0x30c),
++			lr(RX_SWR + 0x328), lr(RX_SWR + 0x344),
++			lr(RX_SWR + 0x360), lr(RX_SWR + 0x1164),
++			lr(RX_SWR + 0x1464));
++	}
++
+ 	if (sapphire_swr_ref_enabled()) sapphire_swr_ref_dump(when);
+ 	if (sapphire_spk_ref_enabled()) {
+ 		for (unsigned i = 0; i < sizeof(sapphire_rx_ref) / sizeof(sapphire_rx_ref[0]); i++) {
+@@ -2216,7 +2247,7 @@ sapphire_ref_dump_delayed(__unused thread_call_param_t p0, __unused thread_call_
+ static void
+ sapphire_ref_dump_start(void)
+ {
+-	if ((!sapphire_spk_ref_enabled() && !sapphire_swr_ref_enabled()) || sapphire_ref_dump_started) return;
++	if ((!sapphire_spk_ref_enabled() && !sapphire_swr_ref_enabled() && !sapphire_spk_dma_enabled()) || sapphire_ref_dump_started) return;
+ 	sapphire_ref_dump_started = true;
+ 	sapphire_ref_dump("start");
+ 	sapphire_ref_dump_call = thread_call_allocate(sapphire_ref_dump_delayed, NULL);
+@@ -2639,10 +2670,28 @@ tone_test(unsigned seconds)
+ 		ring[2 * f + 1] = v;
+ 	}
+ 	mb();
+-	if (!graph_open(ring_pa, bytes, pos_pa) || !sg_cmd(APM_GRAPH_START)) {
++	if (!graph_open(ring_pa, bytes, pos_pa)) {
+ 		LOG("tone: graph failed");
+ 		return;
+ 	}
++	if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) {
++		/* The RXTX DMA must see a clocked RX macro and enabled sink at START. */
++		if (!ports_up) {
++			ports_and_pa();
++			ports_up = true;
++		}
++		if (sapphire_route_failed || !sapphire_codec_on()) {
++			(void)sg_cmd(APM_GRAPH_CLOSE);
++			LOG("tone: DMA sink setup failed");
++			return;
++		}
++	}
++	if (!sg_cmd(APM_GRAPH_START)) {
++		if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) sapphire_codec_off();
++		(void)sg_cmd(APM_GRAPH_CLOSE);
++		LOG("tone: graph start failed");
++		return;
++	}
+ 	if (!ports_up) {
+ 		ports_and_pa();
+ 		ports_up = true;
+@@ -2656,7 +2705,7 @@ tone_test(unsigned seconds)
+ 	if (sapphire_spk_enabled()) {
+ 		sapphire_rx_bits(0x414, 0xff, sapphire_spk_ref_enabled() ? 0u : (uint32_t)vol_db & 0xff, "tone EAR volume");
+ 		sapphire_rx_bits(0x514, 0xff, sapphire_spk_ref_enabled() ? 0xfcu : (uint32_t)vol_db & 0xff, "tone AUX volume");
+-		if (!sapphire_codec_on()) {
++		if (!sapphire_spk_dma_enabled() && !sapphire_codec_on()) {
+ 			(void)sg_cmd(APM_GRAPH_STOP);
+ 			(void)sg_cmd(APM_GRAPH_CLOSE);
+ 			LOG("tone: sapphire codec setup failed");
+@@ -2769,7 +2818,19 @@ stream_start(void)
+ 	if (stream_ran) {
+ 		(void)sg_cmd(APM_GRAPH_PREPARE);
+ 	}
++	if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) {
++		if (!ports_up) {
++			ports_and_pa();
++			ports_up = true;
++		}
++		apply_volume();
++		if (sapphire_route_failed || !sapphire_codec_on()) {
++			LOG("stream: DMA sink setup failed");
++			return;
++		}
++	}
+ 	if (!sg_cmd(APM_GRAPH_START)) {
++		if (sapphire_spk_dma_enabled() && sapphire_spk_enabled()) sapphire_codec_off();
+ 		LOG("stream: start failed");
+ 		return;
+ 	}
+@@ -2785,7 +2846,7 @@ stream_start(void)
+ 	}
+ 	if (sapphire_spk_enabled()) {
+ 		apply_volume();
+-		if (!sapphire_codec_on()) {
++		if (!sapphire_spk_dma_enabled() && !sapphire_codec_on()) {
+ 			(void)sg_cmd(APM_GRAPH_STOP);
+ 			LOG("stream: sapphire codec setup failed");
+ 			return;
+-- 
+2.56.0
+
