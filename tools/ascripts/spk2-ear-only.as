@@ -2,7 +2,7 @@
 # Receiver scene mapping is unresolved. FS34 retains Music; FS35 is off.
 # Keep stereo graph/ring because build18 tone generator interleaves stereo.
 @codec
-tone 1000 5 1638 LR
+tone 1000 5 16000 LR
 @graph
 graph.intf 1
 graph.port 1

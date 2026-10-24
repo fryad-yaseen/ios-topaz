@@ -3,7 +3,7 @@
 # bc1423, 590821, 19=000b/000e. Inspect readbacks before interpretation.
 # Do not treat BC bit3 as an enable; leave it clear as in firmware baseline.
 @codec
-tone 1000 5 1638 LR
+tone 1000 5 16000 LR
 @graph
 graph.intf 1
 graph.port 1

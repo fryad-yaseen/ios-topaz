@@ -2,7 +2,7 @@
 # Same RX0/INP0 control as prior silent test; leave DP1 mono unchanged.
 # DP4 timing mirrors existing master 01000107: interval7, offset1, lane1.
 @codec
-tone 1000 5 1638 LR
+tone 1000 5 16000 LR
 @graph
 graph.intf 1
 graph.port 1
