@@ -1,0 +1,524 @@
+From 75c415478a3c155cab2d751f64db1015fce0baf4 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 12:35:29 +0300
+Subject: [PATCH] sapphire: run ADT audio scripts and flush log before recovery
+ reboot
+
+---
+ bsd/dev/sweet_ufs.c             | 127 +++++++++++-----
+ iokit/Kernel/arm/TopazAudio.cpp | 252 ++++++++++++++++++++++++++++++--
+ 2 files changed, 330 insertions(+), 49 deletions(-)
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60..094fefc 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -904,63 +904,108 @@ struct sweet_log_header {
+ 	uint64_t total, seq;
+ };
+ 
+-static void
+-sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
++static uint64_t sweet_log_flushed, sweet_log_seq;
++static LCK_MTX_DECLARE(sweet_log_flush_lock, &sweet_ufs_grp);
++static bool
++sweet_log_flush(void)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	lck_mtx_lock(&sweet_log_flush_lock);
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total == sweet_log_flushed) {
++		lck_mtx_unlock(&sweet_log_flush_lock);
++		return true;
++	}
++	uint64_t pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
++	int error = 0;
+ 
++	lck_mtx_lock(&sweet_ufs_lock);
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++sweet_log_seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("SWEET LOG: write failed (%d), stopping\n", error);
++		lck_mtx_unlock(&sweet_log_flush_lock);
++		return false;
++	}
++	sweet_log_flushed = total;
++	lck_mtx_unlock(&sweet_log_flush_lock);
++	return true;
++}
++
++static void
++sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+-		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
++		if (!sweet_log_flush()) return;
++	}
++}
+ 
+-		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
+-		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
+-		}
+-		flushed = total;
++/* Downstream msm-poweroff writes 0x77665502 to the device's IMEM
++ * restart_reason@65c for recovery. The shim maps this same word for its
++ * bootloader reset. See Linux drivers/power/reset/msm-poweroff.c:
++ * https://android.googlesource.com/kernel/msm/+/81b58f308fad0a0020eed4dfdec4bdaf51593c6b/drivers/power/reset/msm-poweroff.c
++ * and Linux drivers/power/reset/qcom-pon.c (PON_SOFT_RB_SPARE 0x8f).
++ * PSCI SYSTEM_RESET (SMC32 0x84000009) performs the reset.
++ * Only this one IMEM word is touched. */
++#define SAPPHIRE_RESTART_REASON_PA 0x0c12565cULL
++#define SAPPHIRE_RECOVERY_REASON  0x77665502U
++static void
++sapphire_autoreboot_thread(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	uint64_t uptime_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
++	uint32_t elapsed = (uint32_t)(uptime_ns / 1000000000ULL);
++	if (elapsed < secs)
++		(void)tsleep(&sweet_log_chan, PZERO, "asreboot", hz * (int)(secs - elapsed));
++	printf("SWEET LOG: autoreboot recovery after %u s\n", secs);
++	if (!sweet_log_flush()) printf("SWEET LOG: final flush failed\n");
++	volatile uint32_t *reason = (volatile uint32_t *)ml_io_map(SAPPHIRE_RESTART_REASON_PA, 4);
++	if (reason) {
++		*reason = SAPPHIRE_RECOVERY_REASON;
++		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
++	register uint64_t x0 __asm__("x0") = 0x84000009;
++	__asm__ volatile ("smc #0" : "+r"(x0) :: "memory");
++	for (;;) { }
+ }
+ 
+ static void
+ sweet_log_start(void)
+ {
+-	uint32_t on = 1;
++	uint32_t on = 1, reboot_secs = 0;
+ 	thread_t thread;
++	(void)PE_parse_boot_argn("sapphire_autoreboot", &reboot_secs, sizeof(reboot_secs));
++	if (reboot_secs > 300) reboot_secs = 0;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (reboot_secs) on = 1;
+ 	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
+@@ -971,6 +1016,10 @@ sweet_log_start(void)
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (reboot_secs && kernel_thread_start(sapphire_autoreboot_thread,
++	    (void *)(uintptr_t)reboot_secs, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 5243a44..5145d85 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -22,6 +22,7 @@
+ #include <kern/thread.h>
+ #include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <sys/param.h>
+ #include "SapphireBattmgr.h"
+ 
+@@ -2624,6 +2625,221 @@ sg_cmd(uint32_t opcode)
+ 	return apm(opcode, true, dw, 6);
+ }
+ 
++/* ADT experiment script. The ADT size field permits 2^31-1 bytes, but keep
++ * a private 8 KiB copy so a malformed property cannot consume kernel memory.
++ * Lines are immutable after parsing; only the audio worker executes them. */
++#define AS_MAX 8192
++#define AS_LINES 128
++struct as_line { char *text; uint8_t section; uint16_t every; };
++static char as_text[AS_MAX];
++static as_line as_lines[AS_LINES];
++static unsigned as_count;
++static unsigned as_due[AS_LINES];
++static bool as_enabled;
++static uint32_t as_tone_hz = 1000, as_tone_secs, as_tone_amp = 3277, as_tone_side = 3;
++static uint32_t as_graph_rate = 48000, as_graph_bits = 16, as_graph_channels = 2;
++static uint32_t as_graph_chmap = 0x201, as_graph_intf = 1, as_graph_port = 2, as_graph_dma_index = 3;
++struct as_override { uint32_t module, param, offset, value; };
++static as_override as_overrides[32];
++static unsigned as_override_count;
++static bool as_graph_prepared;
++
++static bool
++as_num(const char *s, uint32_t *out)
++{
++	if (!s || !*s) return false;
++	unsigned base = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 10;
++	if (base == 16) s += 2;
++	uint64_t n = 0;
++	if (!*s) return false;
++	for (; *s; s++) {
++		unsigned d = *s >= '0' && *s <= '9' ? *s - '0' :
++		    *s >= 'a' && *s <= 'f' ? *s - 'a' + 10 :
++		    *s >= 'A' && *s <= 'F' ? *s - 'A' + 10 : 99;
++		if (d >= base) return false;
++		n = n * base + d;
++		if (n > 0xffffffffu) return false;
++	}
++	*out = (uint32_t)n;
++	return true;
++}
++
++static void
++as_load(void)
++{
++	int arg = 0;
++	DTEntry chosen;
++	const void *prop;
++	unsigned int len;
++	if (!PE_parse_boot_argn("sapphire_ascript", &arg, sizeof(arg)) || arg != 1) return;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sapphire-audio-script", &prop, &len) != kSuccess ||
++	    len < 2 || len > AS_MAX || ((const char *)prop)[len - 1] != '\0' ||
++	    memchr(prop, '\0', len - 1) != NULL) {
++		LOG("as load -> missing or oversized ADT property");
++		return;
++	}
++	memcpy(as_text, prop, len);
++	as_enabled = true;
++	unsigned section = 0;
++	for (char *p = as_text; *p && as_count < AS_LINES;) {
++		char *line = p;
++		while (*p && *p != '\n') p++;
++		if (*p) *p++ = '\0';
++		while (*line == ' ' || *line == '\t') line++;
++		char *end = line + strlen(line);
++		while (end > line && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) *--end = '\0';
++		if (!*line || *line == '#') continue;
++		if (strlen(line) >= 160) { LOG("as parse -> line too long"); continue; }
++		if (!strcmp(line, "@codec")) section = 1;
++		else if (!strcmp(line, "@graph")) section = 2;
++		else if (!strcmp(line, "@tone")) section = 3;
++		else if (!strcmp(line, "@stop")) section = 4;
++		else if (section) {
++			uint16_t every = 0;
++			if (!strncmp(line, "every ", 6)) {
++				char *q = line + 6, *space = strchr(q, ' ');
++				uint32_t n = 0;
++				if (!space) { LOG("as parse %s -> bad interval", line); continue; }
++				*space++ = '\0';
++				unsigned z = strlen(q);
++				if (z >= 3 && !strcmp(q + z - 2, "ms")) q[z - 2] = '\0';
++				if (!as_num(q, &n) || n < 10 || n > 10000 || section != 3) {
++					LOG("as parse every -> bad interval"); continue;
++				}
++				every = (uint16_t)n; line = space;
++			}
++			as_lines[as_count++] = { line, (uint8_t)section, every };
++		} else LOG("as parse %s -> no section", line);
++	}
++	LOG("as load -> %u lines%s", as_count, as_count == AS_LINES ? " (limit)" : "");
++}
++
++static bool
++as_mmio(uint32_t pa)
++{
++	if (pa & 3) return false;
++	if (pa >= LPASS_PA && pa <= LPASS_PA + LPASS_SIZE - 4 && lpass) return true;
++	if (pa >= TLMM_GPIO92_PA && pa <= TLMM_GPIO92_PA + 0xffc && gpio92) return true;
++	if (pa >= SAPPHIRE_GPIO99_PA && pa <= SAPPHIRE_GPIO99_PA + 0xffc && sapphire_gpio[1]) return true;
++	if (pa >= SAPPHIRE_GPIO105_PA && pa <= SAPPHIRE_GPIO105_PA + 0xffc && sapphire_gpio[0]) return true;
++	return false;
++}
++static volatile uint32_t *
++as_mmio_ptr(uint32_t pa)
++{
++	if (!as_mmio(pa)) return NULL;
++	if (pa >= LPASS_PA) return (volatile uint32_t *)(lpass + pa - LPASS_PA);
++	if (pa >= SAPPHIRE_GPIO105_PA) return (volatile uint32_t *)(sapphire_gpio[0] + pa - SAPPHIRE_GPIO105_PA);
++	if (pa >= SAPPHIRE_GPIO99_PA) return (volatile uint32_t *)(sapphire_gpio[1] + pa - SAPPHIRE_GPIO99_PA);
++	return (volatile uint32_t *)(gpio92 + pa - TLMM_GPIO92_PA);
++}
++
++/* APM_SET_CFG payloads use [module, param, bytes, reserved] then parameter
++ * words. mf[12] media format: word 7 rate, 8 bit depth/Q, 10 channels,
++ * 11 channel map. pc[12] pull memory; ep[8] endpoint: 4 rate, 5 bits/ch.
++ * intf[8] codec DMA: 4 interface, 5 port, 6 DMA index/channel mask.
++ * graph.u32 addresses a whole payload word by module, param and byte offset. */
++static void
++as_override_payload(uint32_t *p, unsigned words)
++{
++	for (unsigned i = 0; i < as_override_count; i++) {
++		as_override &o = as_overrides[i];
++		if (p[0] == o.module && p[1] == o.param && o.offset / 4 < words)
++			p[o.offset / 4] = o.value;
++	}
++}
++
++static void
++as_exec(unsigned section, const as_line &entry)
++{
++	char line[160], *a[7] = {}, *cursor;
++	strlcpy(line, entry.text, sizeof(line));
++	cursor = line;
++	unsigned n = 0;
++	while (*cursor && n < 7) {
++		while (*cursor == ' ' || *cursor == '\t') cursor++;
++		if (!*cursor || *cursor == '#') break;
++		a[n++] = cursor;
++		while (*cursor && *cursor != ' ' && *cursor != '\t') cursor++;
++		if (*cursor) *cursor++ = '\0';
++	}
++	const char *result = "bad args";
++	uint32_t x = 0, y = 0, z = 0, v = 0;
++	if (!n) return;
++	if (!strcmp(a[0], "log")) { LOG("as %s log -> %s", section == 1 ? "codec" : section == 2 ? "graph" : section == 3 ? "tone" : "stop", (strlen(entry.text) > 4 ? entry.text + 4 : "")); return; }
++	if (!strcmp(a[0], "delay") && n == 2 && as_num(a[1], &x) && x <= 1000) { IOSleep(x); result = "ok"; }
++	else if (!strcmp(a[0], "tone") && section == 1 && n == 5 && as_num(a[1], &x) && as_num(a[2], &y) && as_num(a[3], &z) &&
++	    x >= 20 && x <= 10000 && y >= 1 && y <= 30 && z <= 32767 &&
++	    (!strcmp(a[4], "L") || !strcmp(a[4], "R") || !strcmp(a[4], "LR"))) {
++		as_tone_hz = x; as_tone_secs = y; as_tone_amp = z;
++		as_tone_side = !strcmp(a[4], "L") ? 1 : !strcmp(a[4], "R") ? 2 : 3; result = "ok";
++	}
++	else if (!strncmp(a[0], "graph.", 6) && section == 2) {
++		if (!strcmp(a[0], "graph.u32") && n == 5 && as_num(a[1], &x) && as_num(a[2], &y) &&
++		    as_num(a[3], &z) && as_num(a[4], &v) && !(z & 3) && z >= 16 && z < 48 && as_override_count < 32) {
++			as_overrides[as_override_count++] = { x, y, z, v }; result = "ok";
++		} else if (n == 2 && as_num(a[1], &x)) {
++			if (!strcmp(a[0], "graph.intf") && x <= 3) as_graph_intf = x, result = "ok";
++			else if (!strcmp(a[0], "graph.port") && x <= 15) as_graph_port = x, result = "ok";
++			else if (!strcmp(a[0], "graph.rate") && x >= 8000 && x <= 192000) as_graph_rate = x, result = "ok";
++			else if (!strcmp(a[0], "graph.bits") && (x == 16 || x == 24 || x == 32)) as_graph_bits = x, result = "ok";
++			else if (!strcmp(a[0], "graph.channels") && x >= 1 && x <= 2) as_graph_channels = x, result = "ok";
++			else if (!strcmp(a[0], "graph.chmap") && x <= 0xffff) as_graph_chmap = x, result = "ok";
++			else if (!strcmp(a[0], "graph.dma_index") && x <= 15) as_graph_dma_index = x, result = "ok";
++		}
++	}
++	else if (n == 3 && as_num(a[1], &x) && as_num(a[2], &y)) {
++		if (!strcmp(a[0], "rx") && x <= 0x1fff && !(x & 3) && y <= 255 && lpass) lw(RX_MACRO + x, y), result = "ok";
++		else if ((!strcmp(a[0], "wcd") || !strcmp(a[0], "swrs")) && x <= 0xffff && y <= 255 && lpass)
++			swr_wr(!strcmp(a[0], "wcd") ? VA_SWR : RX_SWR, 1, x, y), result = "ok";
++		else if (!strcmp(a[0], "swr") && x <= 0x1ffc && !(x & 3) && lpass) lw(RX_SWR + x, y), result = "ok";
++		else if (!strcmp(a[0], "mmio") && as_mmio(x)) { *as_mmio_ptr(x) = y; mb(); result = "ok"; }
++	}
++	else if (!strcmp(a[0], "i2c") && n == 4 && as_num(a[1], &x) && as_num(a[2], &y) && as_num(a[3], &z) &&
++	    (x == 34 || x == 35) && y <= 255 && z <= 0xffff) result = sweet_i2c1_write16((uint8_t)(x + 0x12), (uint8_t)y, (uint16_t)z) ? "i2c error" : "ok";
++	else if (!strcmp(a[0], "rd") && (n == 3 || n == 4) && as_num(a[2], &x) &&
++	    (n == 3 || as_num(a[3], &y)) && (n == 3 || (y >= 1 && y <= 8))) {
++		unsigned count = n == 3 ? 1 : y;
++		char values[100] = "";
++		result = "ok";
++		for (unsigned i = 0; i < count; i++) {
++			uint32_t addr = x + i * ((!strcmp(a[1], "wcd") || !strcmp(a[1], "swrs") || !strcmp(a[1], "i2c34") || !strcmp(a[1], "i2c35")) ? 1 : 4);
++			uint32_t val = 0; bool ok = true;
++			if (!strcmp(a[1], "rx") && addr <= 0x1ffc && !(addr & 3) && lpass) val = lr(RX_MACRO + addr);
++			else if (!strcmp(a[1], "swr") && addr <= 0x1ffc && !(addr & 3) && lpass) val = lr(RX_SWR + addr);
++			else if ((!strcmp(a[1], "wcd") || !strcmp(a[1], "swrs")) && addr <= 0xffff && lpass) {
++				uint8_t b = 0; ok = swr_rd(!strcmp(a[1], "wcd") ? VA_SWR : RX_SWR, 1, addr, &b); val = b;
++			} else if ((!strcmp(a[1], "i2c34") || !strcmp(a[1], "i2c35")) && addr <= 255) {
++				uint16_t b = 0; ok = sapphire_fs_read(!strcmp(a[1], "i2c34") ? 0x34 : 0x35, addr, &b) == 0; val = b;
++			} else if (!strcmp(a[1], "mmio") && as_mmio(addr)) val = *as_mmio_ptr(addr);
++			else ok = false;
++			if (!ok) { result = "read error"; break; }
++			char word[13];
++			snprintf(word, sizeof(word), "%s%08x", i ? "," : "", val);
++			strlcat(values, word, sizeof(values));
++		}
++		LOG("as %s %.72s -> %s %s", section == 1 ? "codec" : section == 2 ? "graph" : section == 3 ? "tone" : "stop", entry.text, result, values);
++		return;
++	}
++	LOG("as %s %.90s -> %s", section == 1 ? "codec" : section == 2 ? "graph" : section == 3 ? "tone" : "stop", entry.text, result);
++}
++
++static void
++as_run(unsigned section, bool periodic = false, unsigned elapsed = 0)
++{
++	if (!as_enabled) return;
++	for (unsigned i = 0; i < as_count; i++) {
++		const as_line &e = as_lines[i];
++		if (e.section != section || (e.every != 0) != periodic) continue;
++		if (periodic) {
++			if (elapsed < as_due[i]) continue;
++			as_due[i] = elapsed + e.every;
++		}
++		as_exec(section, e);
++	}
++}
++
+ /*
+  * Graph SH_MEM_PULL_MODE (the DSP reads the ring itself) -> CODEC_DMA_SINK on RX_CODEC_DMA_RX_1
+  * (AIF2_PB -> RX2 -> INT2 -> AUX), 48 kHz 16-bit stereo; TopazSpeaker HwStreamPrepare().
+@@ -2638,16 +2854,23 @@ graph_open(uint64_t ring_pa, uint32_t ring_bytes, uint64_t pos_pa)
+ 		1, 0x08001003, 56, 0, 2, PULL, 1, 0x08001015, 8, 0, 1, DMA, 1, 0x08001015, 8, 1, 0, 0,
+ 		1, 0x08001004, 24, 0, 1, PULL, 1, DMA, 2, 0
+ 	};
+-	const uint32_t ch = 2, rate = 48000;
+-	uint32_t mf[12] = { PULL, 0x0800100C, 32, 0, 1, 0x09001000, 20, rate, 16 | (1u << 16), 16 | (15u << 16),
+-		            1 | (ch << 16), 1 | (2u << 8) };
++	if (!as_graph_prepared) {
++		as_graph_prepared = true;
++		for (unsigned i = 0; i < as_count; i++)
++			if (as_lines[i].section == 2 && !strncmp(as_lines[i].text, "graph.", 6)) as_exec(2, as_lines[i]);
++	}
++	const uint32_t ch = as_graph_channels, rate = as_graph_rate;
++	uint32_t mf[12] = { PULL, 0x0800100C, 32, 0, 1, 0x09001000, 20, rate, as_graph_bits | (1u << 16), as_graph_bits | (15u << 16),
++		            1 | (ch << 16), as_graph_chmap };
+ 	bool ok = mem_map(ring_pa, ring_bytes, 0, &ring_map) && mem_map(pos_pa, 0x1000, 2, &pos_map) &&
+ 	    apm(APM_GRAPH_OPEN, true, open, sizeof(open) / 4);
+ 	uint32_t pc[12] = { PULL, 0x0800100A, 28, 0, (uint32_t)ring_pa, 1, ring_bytes, ring_map,
+ 		            (uint32_t)pos_pa, 1, pos_map, 0 };
+-	uint32_t ep[8] = { DMA, 0x08001017, 12, 0, rate, 16 | (ch << 16), 1, 0 };
+-	uint32_t intf[8] = { DMA, 0x08001063, 12, 0, 1, 2, 3, 0 };          /* RXTX, RX_1, channels 0x3 */
++	uint32_t ep[8] = { DMA, 0x08001017, 12, 0, rate, as_graph_bits | (ch << 16), 1, 0 };
++	uint32_t intf[8] = { DMA, 0x08001063, 12, 0, as_graph_intf, as_graph_port, as_graph_dma_index, 0 };          /* RXTX, RX_1, channels 0x3 */
+ 
++	as_override_payload(mf, 12); as_override_payload(pc, 12);
++	as_override_payload(ep, 8); as_override_payload(intf, 8);
+ 	ok = ok && apm(APM_SET_CFG, true, mf, 12) && apm(APM_SET_CFG, true, pc, 12) && apm(APM_SET_CFG, true, ep, 8) &&
+ 	    apm(APM_SET_CFG, true, intf, 8) && sg_cmd(APM_GRAPH_PREPARE);
+ 	LOG("t=%u.%03u graph open/prepare: %s (maps %x %x)", T, ok ? "OK" : "FAILED", ring_map, pos_map);
+@@ -2790,6 +3013,7 @@ sapphire_spk_test_status(unsigned phase, unsigned mode, volatile uint32_t *pos)
+ static void
+ tone_test(unsigned seconds, unsigned test_mode)
+ {
++	if (as_tone_secs) seconds = as_tone_secs;
+ 	const uint32_t frames = 48000, bytes = frames * 4;  /* 1 s, a whole number of 1 kHz periods */
+ 	uint64_t ring_pa = 0, pos_pa = 0;
+ 	int16_t *ring = (int16_t *)topaz_pool_alloc(bytes, &ring_pa);
+@@ -2802,14 +3026,15 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 		return;
+ 	}
+ 	for (uint32_t f = 0; f < frames; f++) {
+-		uint32_t k = f % 48, a = k % 24;
++		uint32_t k = (uint32_t)(((uint64_t)f * as_tone_hz * 48 / 48000) % 48), a = k % 24;
+ 		int16_t v = a <= 12 ? q[a] : q[24 - a];
+ 		v = k < 24 ? v : (int16_t)-v;
++		v = (int16_t)((int32_t)v * (int32_t)as_tone_amp / 3277);
+ 		if (test_mode && (f / 12000) % 2) v = 0; /* 250 ms on/off */
+ 		bool left = test_mode != 2 && (test_mode != 3 || (f / 24000) == 0);
+ 		bool right = test_mode != 1 && (test_mode != 3 || (f / 24000) == 1);
+-		ring[2 * f] = left ? v : 0;
+-		ring[2 * f + 1] = right ? v : 0;
++		ring[2 * f] = left && (as_tone_side & 1) ? v : 0;
++		ring[2 * f + 1] = right && (as_tone_side & 2) ? v : 0;
+ 	}
+ 	mb();
+ 	if (test_mode)
+@@ -2837,6 +3062,8 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 		LOG("tone: graph start failed");
+ 		return;
+ 	}
++	for (unsigned i = 0; i < as_count; i++)
++		if (as_lines[i].section == 2 && strncmp(as_lines[i].text, "graph.", 6)) as_exec(2, as_lines[i]);
+ 	if (!ports_up) {
+ 		ports_and_pa();
+ 		ports_up = true;
+@@ -2872,8 +3099,9 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 		LOG("t=%u.%03u tone: playing %u s, EAR 0 dB AUX -4 dB", T, seconds);
+ 	else
+ 		LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
++	as_run(3);
+ 	unsigned probe_start = ms(), probe_next = probe_start, probe_n = 0;
+-	unsigned out_status = 0;
++	unsigned out_status = 0, as_next = probe_start + 50;
+ 	bool probe = sapphire_spk_probe_enabled();
+ 	unsigned test_phase = ~0u;
+ 	for (unsigned t = probe_start; ms() - t < seconds * 1000;) {
+@@ -2889,6 +3117,7 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 				sapphire_spk_test_status(phase, test_mode, pos);
+ 			}
+ 		}
++		if (as_enabled && ms() >= as_next) { as_run(3, true, ms() - probe_start); as_next = ms() + 50; }
+ 		if (probe && probe_n < seconds * 20 && ms() >= probe_next) {
+ 			sapphire_spk_probe_sample(probe_n++, pos);
+ 			probe_next += 50;
+@@ -2912,6 +3141,7 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 	}
+ 	(void)sg_cmd(APM_GRAPH_STOP);
+ 	(void)sg_cmd(APM_GRAPH_CLOSE);
++	as_run(4);
+ 	LOG("t=%u.%03u tone: stopped", T);
+ }
+ 
+@@ -3212,6 +3442,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 	unsigned last_status = 0;
+ 	bool codec_tried = false;
+ 
++	as_load();
+ 	if (!topaz_soc_map()) {
+ 		LOG("no SoC mappings (see TopazModem)");
+ 		goto out;
+@@ -3273,10 +3504,11 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			codec_tried = true;
+ 			(void)PE_parse_boot_argn("adsp_vol", &vol_db, sizeof(vol_db));
+ 			if (codec_bringup()) {
++				as_run(1);
+ 				unsigned test_mode = sapphire_spk_test_mode();
+ 				if (test_mode) {
+ 					tone_test(2, test_mode);
+-				} else if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
++				} else if (as_tone_secs || (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0)) {
+ 					tone_test(MIN(tone, 10u), 0);
+ 				}
+ 				if (stream_open()) {
+-- 
+2.56.0
+

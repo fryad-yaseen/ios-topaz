@@ -36,9 +36,15 @@ if [ -z "${D22AP_ADT:-}" ]; then
 fi
 export D22AP_ADT
 test -s "$D22AP_ADT" || { echo "set D22AP_ADT to the extracted d22ap.adt" >&2; exit 1; }
-python3 "$repo/tools/mkadt.py" "$tmp/sapphire-amp.adt" --highmem --amp
+adt_args=()
+if [ -n "${AUDIO_SCRIPT:-}" ]; then
+	adt_args+=(--audio-script "$AUDIO_SCRIPT")
+fi
+python3 "$repo/tools/mkadt.py" "$tmp/sapphire-amp.adt" --highmem --amp "${adt_args[@]}"
 
-cmdline="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=${SWEETFB_HZ:-30} sweettouchxmax=2160 sweettouchymax=2400 modem=1 wifi=1 gpu=1 topaz_inject=/topaz/lib/libtopaz-inject.dylib,backboardd,containermanagerd,containermanagerd_system adsp=1 gpu_mhz=600 sapphire_amp=1${EXTRA_ARGS:+ $EXTRA_ARGS}"
+cmdline="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=${SWEETFB_HZ:-30} sweettouchxmax=2160 sweettouchymax=2400 modem=1 wifi=1 gpu=1 topaz_inject=/topaz/lib/libtopaz-inject.dylib,backboardd,containermanagerd,containermanagerd_system adsp=1 gpu_mhz=${GPU_MHZ:-600} sapphire_amp=1${EXTRA_ARGS:+ $EXTRA_ARGS}"
+echo "boot-args: ${#cmdline} chars" >&2
+if [ ${#cmdline} -ge 600 ]; then echo 'boot-args must be under 600 chars' >&2; exit 1; fi
 python3 "$repo/tools/mkpayload.py" "$kernel" "$tmp/sapphire-amp.adt" "$tmp/payload.bin" --cmdline "$cmdline"
 
 export MKBOOTIMG="${MKBOOTIMG:-python3 /home/fryad/projects/lunaris/src/system/tools/mkbootimg/mkbootimg.py}"

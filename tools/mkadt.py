@@ -77,7 +77,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, amp=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, amp=False, audio_script=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     if amp and qemu:
         raise ValueError('AMP topology is for the phone, not QEMU virt')
@@ -130,6 +130,12 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, amp=
         # The iOS shared cache is in no trust cache, so dyld can only map it
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+    if audio_script is not None:
+        # ADT property size is a 31-bit field; the kernel deliberately caps
+        # this experiment input further to 8192 bytes including the NUL.
+        if len(audio_script) > 8191 or b'\0' in audio_script:
+            raise ValueError('audio script must be NUL-free and at most 8191 bytes')
+        chosen.props.append(('sapphire-audio-script', 0, audio_script + b'\0'))
 
     # Gold first: XNU assigns logical IDs by ADT order and expects the boot
     # core, MPIDR 0x100, at logical ID 0. --amp adds Silver as the E cluster;
@@ -259,11 +265,18 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, amp=
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
-                 amp='--amp' in sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('output')
+    for flag in ('qemu', 'highmem', 'native', 'midmem', 'amp', 'dump'):
+        parser.add_argument('--' + flag, action='store_true')
+    parser.add_argument('--audio-script', type=argparse.FileType('rb'))
+    args = parser.parse_args()
+    root = build(qemu=args.qemu, highmem=args.highmem, native=args.native,
+                 midmem=args.midmem, amp=args.amp,
+                 audio_script=args.audio_script.read() if args.audio_script else None)
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(args.output, 'wb').write(blob)
+    if args.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{args.output}: {len(blob)} bytes', file=sys.stderr)
