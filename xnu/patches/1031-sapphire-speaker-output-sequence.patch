@@ -1,0 +1,109 @@
+From f44c9fc096e102cd7e1c4e14c30b817c7de2af56 Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 11:12:58 +0300
+Subject: [PATCH] sapphire: sequence speaker output after graph start
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 69 +++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index ba0a8f6..5243a44 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2673,6 +2673,66 @@ sapphire_spk_probe_enabled(void)
+ 	return enabled != 0;
+ }
+ 
++static bool
++sapphire_spk_out_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int arg = 0;
++		enabled = PE_parse_boot_argn("sapphire_spk_out", &arg, sizeof(arg)) && arg == 1;
++	}
++	return enabled != 0 && sapphire_spk_enabled() && sapphire_spk_ref_enabled();
++}
++
++/* DAPM's interpolator PRE/POST_PMU and the stream unmute occur after the
++ * graph starts. Recreate their edges while PCM is available at RX_1. */
++static void
++sapphire_spk_out_sequence(uint8_t ear_volume, uint8_t aux_volume)
++{
++	const uint32_t path[] = { 0x400, 0x500 };
++	for (unsigned i = 0; i < 2; i++) {
++		sapphire_rx_bits(path[i], 0x10, 0x10, "out PGA mute");
++		sapphire_rx_bits(path[i], 0x20, 0x00, "out clock stop");
++		sapphire_rx_bits(path[i], 0x40, 0x40, "out reset assert");
++		sapphire_rx_bits(path[i], 0x40, 0x00, "out reset release");
++		sapphire_rx_bits(path[i], 0x20, 0x20, "out clock enable");
++	}
++	/* EAR/AUX DAC and RDAC are already clocked by sapphire_codec_on(). */
++	(void)sapphire_wcd_bits(0x300a, 0x80, 0x00, "out EAR PA edge low");
++	(void)sapphire_wcd_bits(0x3128, 0x80, 0x00, "out AUX PA edge low");
++	(void)sapphire_wcd_bits(0x3465, 0x07, 0x03, "out EAR watchdog");
++	(void)sapphire_wcd_bits(0x3467, 0x05, 0x05, "out AUX watchdog");
++	(void)sapphire_wcd_bits(0x300b, 0x80, 0x80, "out EAR compander");
++	(void)sapphire_wcd_bits(0x300a, 0x80, 0x80, "out EAR PA edge high");
++	IOSleep(6); /* wcd937x_codec_enable_ear_pa POST_PMU */
++	(void)sapphire_wcd_bits(0x3128, 0x80, 0x80, "out AUX PA edge high");
++	IOSleep(1); /* wcd937x_codec_enable_aux_pa POST_PMU */
++	(void)sapphire_wcd_bits(0x3008, 0xc2, 0xc2, "out PA supplies");
++	/* rx_macro_enable_main_path POST_PMU latches volume after clock-on. */
++	sapphire_rx_bits(0x414, 0xff, ear_volume, "out EAR volume latch");
++	sapphire_rx_bits(0x514, 0xff, aux_volume, "out AUX volume latch");
++	IOSleep(1);
++	for (unsigned i = 0; i < 2; i++)
++		sapphire_rx_bits(path[i], 0x10, 0x00, "out stream unmute");
++}
++
++static void
++sapphire_spk_out_status(const char *when)
++{
++	static const uint8_t regs[] = { 0x21, 0x28, 0x59, 0xbc, 0x03, 0x04 };
++	LOG("spkout %s rx400=%02x rx500=%02x rx40c=%02x rx50c=%02x rx410=%02x rx510=%02x",
++	    when, lr(RX_MACRO + 0x400) & 0xff, lr(RX_MACRO + 0x500) & 0xff,
++	    lr(RX_MACRO + 0x40c) & 0xff, lr(RX_MACRO + 0x50c) & 0xff,
++	    lr(RX_MACRO + 0x410) & 0xff, lr(RX_MACRO + 0x510) & 0xff);
++	for (unsigned side = 0; side < 2; side++) {
++		for (unsigned i = 0; i < sizeof(regs); i++) {
++			uint16_t value = 0;
++			int err = sapphire_fs_read((uint8_t)(0x34 + side), regs[i], &value);
++			LOG("spkout %s fs%u reg%02x=%04x err=%d", when, side, regs[i], value, err);
++		}
++	}
++}
++
+ static void
+ sapphire_spk_probe_sample(unsigned n, volatile uint32_t *pos)
+ {
+@@ -2796,6 +2856,9 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 			LOG("tone: sapphire codec setup failed");
+ 			return;
+ 		}
++		if (sapphire_spk_out_enabled())
++			sapphire_spk_out_sequence(sapphire_spk_ref_enabled() ? 0u : (uint8_t)vol_db,
++			    sapphire_spk_ref_enabled() ? 0xfcu : (uint8_t)vol_db);
+ 		amp_on(true); /* FS1815 analog input is fed by the now-ready codec PAs. */
+ 		sapphire_route_dump();
+ 		sapphire_ref_dump_start();
+@@ -2810,9 +2873,15 @@ tone_test(unsigned seconds, unsigned test_mode)
+ 	else
+ 		LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
+ 	unsigned probe_start = ms(), probe_next = probe_start, probe_n = 0;
++	unsigned out_status = 0;
+ 	bool probe = sapphire_spk_probe_enabled();
+ 	unsigned test_phase = ~0u;
+ 	for (unsigned t = probe_start; ms() - t < seconds * 1000;) {
++		if (sapphire_spk_out_enabled() && out_status < 2 &&
++		    ms() - probe_start >= (out_status == 0 ? 200u : 1000u)) {
++			sapphire_spk_out_status(out_status == 0 ? "+200ms" : "+1s");
++			out_status++;
++		}
+ 		if (test_mode) {
+ 			unsigned phase = (ms() - probe_start) / 250;
+ 			if (phase != test_phase) {
+-- 
+2.56.0
+
