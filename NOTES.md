@@ -442,3 +442,18 @@ HPH SWR timing is derived from saved Android speaker captures plus upstream DP1
 stereo mapping; there is no captured headphone-playing dump. Audibility remains
 unverified. No combined speaker+HPH mode because shared RX0/supplies conflict.
 See `/home/fryad/ios-build/PROGRESS.md` for exact future test command and push hash.
+
+## 2026-10-24 21:xx +03: build18 speaker research after audible HPH
+
+HPH run2 is audible. spk-on-rx0 remains silent despite RX0 graph and latched
+INT0/INT2 muxes. Added four unrun build18-only scripts, ranked:
+spk-supply-rearm, spk-inp0-rx0, spk-dp1-stereo, spk-aux-dapm.
+Read tools/ascripts/spk-tests-2026-10-24.md for findings, source references,
+limitations and exact commands using speaker base and120s autoreboot.
+EAR already shares DP1 bit0 with HPHL. HPH INT0 uses05 vs failed speaker50;
+HPH master/slave DP1 masks3 vs speaker1. Supply final state matches Android,
+but ordered edges remain unproven. AUX upstream bit4/WD7 differs from vendor
+HP_MODE bit4 clear/WD5. No obvious missing EAR PA enable bit found.
+Static interpreter bounds/commands and diff checks passed. No phone command,
+build, flash, image generation or push. Hardware results remain pending.
+Full observed comparison TSV and saved-source notes are in ~/ios-build/research.
