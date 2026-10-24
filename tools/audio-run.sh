@@ -18,7 +18,7 @@ until fastboot devices | grep -q .; do sleep 2; done
 if fastboot getvar all 2>&1 | grep -q 'unbootable:a:yes'; then fastboot set_active a; fi
 fastboot boot "$out"
 echo "Waiting for OrangeFox recovery..." >&2
-timeout 300 bash -c '
+timeout 420 bash -c '
   until adb devices 2>/dev/null | grep -q recovery; do
     if fastboot devices | grep -q .; then
       fastboot reboot recovery
