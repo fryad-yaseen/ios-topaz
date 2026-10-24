@@ -302,6 +302,8 @@ struct eagl {
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
 	uint64_t upload_bytes, began, attaching, flushing;
+	uint64_t end_blit_us, end_flush_us, end_sync_us, end_surface_us;
+	unsigned flushes, end_flushes;
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
@@ -978,21 +980,32 @@ static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
-	uint64_t before, waited, after;
+	uint64_t before, waited, after, step;
 	unsigned copied = 0, in_place = 0;
+	bool blitted = false;
 
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+			step = now_us();
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
+			e->end_blit_us += now_us() - step;
 			in_place++;
-			glFlush();                              /* (also after a glFinish: the copy is new since) */
+			blitted = true;
 		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
 		}
 	}
+	/* Submit all mirror blits together, including those made after an earlier glFinish. */
+	if (blitted) {
+		step = now_us();
+		glFlush();
+		e->end_flush_us += now_us() - step;
+		e->end_flushes++;
+	}
+	step = now_us();
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
@@ -1011,7 +1024,9 @@ frame_end(struct eagl *e, bool finished)
 			glDeleteSync(sync);
 		}
 	}
+	e->end_sync_us += now_us() - step;
 	waited = now_us();
+	step = waited;
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
 			copied += !e->images[i].shared;
@@ -1021,6 +1036,7 @@ frame_end(struct eagl *e, bool finished)
 			}
 		}
 	}
+	e->end_surface_us += now_us() - step;
 	if (!e->in_frame) {
 		return;
 	}
@@ -1079,9 +1095,11 @@ frame_end(struct eagl *e, bool finished)
 	if (e->frames <= 40 || e->frames % 20 == 0) {
 		say("redwood-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
-		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
+		    "out), %llu before it for the IOSurfaces; flush %llu us/%u, end blit %llu, end flush %llu us/%u, "
+		    "end sync %llu, end surface %llu us\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
-		    after - waited, e->attaching);
+		    after - waited, e->attaching, e->flushing, e->flushes, e->end_blit_us, e->end_flush_us,
+		    e->end_flushes, e->end_sync_us, e->end_surface_us);
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
@@ -1093,6 +1111,8 @@ frame_end(struct eagl *e, bool finished)
 	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
 	e->upload_bytes = e->attaching = e->flushing = 0;
+	e->end_blit_us = e->end_flush_us = e->end_sync_us = e->end_surface_us = 0;
+	e->flushes = e->end_flushes = 0;
 }
 
 #ifndef GL_BLEND
@@ -2944,6 +2964,7 @@ my_glFlush(void *context)
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
+	e->flushes++;
 	frame_end(e, false);
 	EAGL_LEAVE(e, 0x2d8);
 }
