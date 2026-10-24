@@ -1,0 +1,197 @@
+From e8c30f4edef19940dbe2b3316c70cf70d42919dd Mon Sep 17 00:00:00 2001
+From: fryad-yaseen <fryadyazeez@gmail.com>
+Date: Sat, 24 Oct 2026 10:27:02 +0300
+Subject: [PATCH] sapphire: gate nonblocking present and stage timing
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 88 ++++++++++++++++++++++++++-
+ 1 file changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 35ef41c..08488c1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,28 @@ static void dsi_sapphire_ref_dump(volatile uint8_t *base);
+  * one vsync after the next frame replaced it on the panel.
+  */
+ static uint64_t sweet_fps_tick;         /* mach time of the last vsync tick (SWEET FPS) */
++static int sapphire_fast_present = -1;
++static uint64_t fast_ns[6]; /* GPU fence, lookup, copy, cache, registers, release */
++static uint32_t fast_frames, fast_latch_busy, fast_dropped;
++
++static bool
++fastPresentEnabled(void)
++{
++	if (sapphire_fast_present < 0) {
++		uint32_t value = 0;
++		sapphire_fast_present = PE_parse_boot_argn("sapphire_fast_present", &value, sizeof(value)) && value == 1;
++	}
++	return sapphire_fast_present != 0;
++}
++
++static void
++fastTime(unsigned stage, uint64_t began)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	fast_ns[stage] += ns;
++}
++
+ 
+ /* boot-arg sweetfb_nohold=1 (a test): frames on the panel are not marked in use */
+ static bool
+@@ -713,8 +735,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	/* frames replaced at the previous vsync have been latched by now */
+ 	SweetSurface *retire[4];
+-	memcpy(retire, fb->fRetireHold, sizeof(retire));
+-	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
++	if (!fastPresentEnabled() || fb->fCtl0 == NULL || (fb->fCtl0[0x18 / 4] & 0x20001) == 0) {
++		memcpy(retire, fb->fRetireHold, sizeof(retire));
++		bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
++	} else {
++		bzero(retire, sizeof(retire));
++		fast_latch_busy++;
++	}
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+ 	if (fb->fConsShown && sweet_console_copy_dirty(fb->backBuffer())) {
+@@ -1016,6 +1043,17 @@ sweet_fps_count(void)
+ 	gap_max = gap > gap_max ? gap : gap_max;
+ 	absolutetime_to_nanoseconds(now - window, &ns);
+ 	if (ns >= 1000000000ull) {
++		if (fastPresentEnabled()) {
++			IOLog("SWEET PRESENT: %u frames, gpu %llu lookup %llu copy %llu cache %llu mdp+flush %llu release %llu us/frame; latch busy %u dropped %u\n",
++			    fast_frames, fast_frames ? fast_ns[0] / 1000 / fast_frames : 0,
++			    fast_frames ? fast_ns[1] / 1000 / fast_frames : 0,
++			    fast_frames ? fast_ns[2] / 1000 / fast_frames : 0,
++			    fast_frames ? fast_ns[3] / 1000 / fast_frames : 0,
++			    fast_frames ? fast_ns[4] / 1000 / fast_frames : 0,
++			    fast_frames ? fast_ns[5] / 1000 / fast_frames : 0, fast_latch_busy, fast_dropped);
++			bzero(fast_ns, sizeof(fast_ns));
++			fast_frames = fast_latch_busy = fast_dropped = 0;
++		}
+ 		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame: %llu us in present + latch, "
+ 		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
+ 		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);
+@@ -1124,6 +1162,38 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ {
+ 	SweetSurface *held[4];
+ 	memcpy(held, heldIn, sizeof(held));
++	if (fastPresentEnabled()) {
++		/* The flush bit clears when MDP latches the last address. Do not
++		 * overwrite an outstanding flip or release its scanned surface. */
++		if ((fCtl0[0x18 / 4] & 0x20001) != 0) {
++			fast_latch_busy++;
++			fast_dropped++;
++			sweet_hold_set(held, false);
++			return;
++		}
++		SweetSurface *dropped[4], *retired[4], *shown[4];
++		uint64_t t = mach_absolute_time();
++		IOLockLock(fLock);
++		memcpy(dropped, fPendHold, sizeof(dropped));
++		memcpy(retired, fRetireHold, sizeof(retired));
++		bzero(fPendHold, sizeof(fPendHold));
++		bzero(fRetireHold, sizeof(fRetireHold));
++		fDirty = false;
++		IOLockUnlock(fLock);
++		sweet_hold_set(dropped, false);
++		sweet_hold_set(retired, false);
++		fastTime(5, t);
++		present(rec);
++		t = mach_absolute_time();
++		IOLockLock(fLock);
++		memcpy(shown, fShowHold, sizeof(shown));
++		memcpy(fRetireHold, shown, sizeof(shown));
++		memcpy(fShowHold, held, sizeof(held));
++		IOLockUnlock(fLock);
++		fastTime(5, t);
++		fast_frames++;
++		return;
++	}
+ 	{
+ 		SweetSurface *dropped[4], *shown[4], *retired[4];
+ 		IOLockLock(fLock);
+@@ -1174,6 +1244,7 @@ AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
++	uint64_t began = fastPresentEnabled() ? mach_absolute_time() : 0;
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -1181,6 +1252,7 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
++	if (began) fastTime(4, began);
+ }
+ 
+ /*
+@@ -1615,7 +1687,9 @@ void
+ AppleCLCD::flipBack(void)
+ {
+ 	uint32_t idx = fFlipIdx ^ 1;
++	uint64_t began = fastPresentEnabled() ? mach_absolute_time() : 0;
+ 	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
++	if (began) fastTime(3, began);
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+ 	fFlipIdx = idx;
+ }
+@@ -1624,6 +1698,7 @@ void
+ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ {
+ 	uint8_t *dst = backBuffer();
++	uint64_t began = fastPresentEnabled() ? mach_absolute_time() : 0;
+ 	if (srcStride == fRowBytes) {
+ 		memcpy(dst, src, (size_t)fRowBytes * fHeight);
+ 	} else {
+@@ -1631,6 +1706,7 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ 			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
+ 		}
+ 	}
++	if (began) fastTime(2, began);
+ 	flipBack();
+ }
+ 
+@@ -1655,12 +1731,16 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	if (n != 1) {
+ 		return false;
+ 	}
++	uint64_t began = fastPresentEnabled() ? mach_absolute_time() : 0;
+ 	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (began) fastTime(1, began);
+ 	if (s == NULL) {
+ 		return false;
+ 	}
+ 	bool ok = false;
++	uint64_t gpuBegan = began ? mach_absolute_time() : 0;
+ 	(void)topaz_surface_drawn(s, 100);
++	if (gpuBegan) fastTime(0, gpuBegan);
+ 	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+@@ -1671,7 +1751,9 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		}
+ 		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
++			uint64_t lookupBegan = began ? mach_absolute_time() : 0;
+ 			uintptr_t va = s->kernelAddress();
++			if (lookupBegan) fastTime(1, lookupBegan);
+ 			if (va != 0) {
+ 				/*
+ 				 * Copy into our back buffer and flip: CoreAnimation may start the
+@@ -1685,7 +1767,9 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);
+ 				} else {
++					uint64_t cleanBegan = began ? mach_absolute_time() : 0;
+ 					sweet_dcache_clean((vm_offset_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
++					if (cleanBegan) fastTime(3, cleanBegan);
+ 					scanFrom(pa, s->bytesPerRow);
+ 				}
+ 				ok = true;
+-- 
+2.56.0
+
